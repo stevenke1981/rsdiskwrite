@@ -1,0 +1,17 @@
+[package]
+name = "rsdiskwrite"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Windows disk image writer with an AcmeUI Native interface"
+license = "MIT"
+
+[dependencies]
+acme-core = { git = "https://github.com/stevenke1981/AcmeUI-Native.git", rev = "a3e758852b77c7e94c344a267c55d7cb7441c965" }
+acme-platform = { git = "https://github.com/stevenke1981/AcmeUI-Native.git", rev = "a3e758852b77c7e94c344a267c55d7cb7441c965" }
+acme-render-wgpu = { git = "https://github.com/stevenke1981/AcmeUI-Native.git", rev = "a3e758852b77c7e94c344a267c55d7cb7441c965" }
+acme-text = { git = "https://github.com/stevenke1981/AcmeUI-Native.git", rev = "a3e758852b77c7e94c344a267c55d7cb7441c965" }
+flate2 = "1.1"
+tempfile = "3.27"
+rfd = "0.15"
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
