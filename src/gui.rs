@@ -42,7 +42,7 @@ struct App {
     bytes_written: u64,
     buttons: Vec<(Action, [f32; 4])>,
     pressed: Option<Action>,
-    focused: usize,
+    focused: Action,
     sender: Sender<Update>,
     receiver: Receiver<Update>,
     waker: Option<Waker>,
@@ -51,7 +51,7 @@ struct App {
 impl App {
     fn new() -> Self {
         let (sender, receiver) = mpsc::channel();
-        let mut app = Self {
+        Self {
             fonts: FontSystem::new(),
             atlas: GlyphAtlas::default(),
             image: None,
@@ -64,13 +64,11 @@ impl App {
             bytes_written: 0,
             buttons: Vec::new(),
             pressed: None,
-            focused: 0,
+            focused: Action::Browse,
             sender,
             receiver,
             waker: None,
-        };
-        app.refresh();
-        app
+        }
     }
 
     fn refresh(&mut self) {
@@ -106,8 +104,7 @@ impl App {
                     .set_title("Select disk image")
                     .pick_file()
                 {
-                    self.image = Some(path);
-                    self.status = "Image selected. Choose the target disk.".into();
+                    self.select_image(path);
                 }
             }
             Action::Refresh => self.refresh(),
@@ -125,6 +122,13 @@ impl App {
             Action::AllowLarge => self.allow_large = !self.allow_large,
             Action::Write => self.start_write(),
         }
+    }
+
+    fn select_image(&mut self, path: PathBuf) {
+        self.image = Some(path);
+        self.selected = None;
+        self.bytes_written = 0;
+        self.status = "Image selected. Choose the target disk.".into();
     }
 
     fn start_write(&mut self) {
@@ -233,7 +237,7 @@ impl App {
         } else {
             [0.16, 0.19, 0.24, 1.0]
         };
-        let focused = self.buttons.len() == self.focused && enabled;
+        let focused = action == self.focused && enabled;
         frame.quads.push(Quad {
             rect,
             color: fill,
@@ -323,6 +327,9 @@ impl Application for App {
                     .map(|(a, _)| *a);
                 if pressed {
                     self.pressed = hit;
+                    if let Some(action) = hit {
+                        self.focused = action;
+                    }
                 } else {
                     let down = self.pressed.take();
                     if let Some(action) = hit.filter(|_| hit == down) {
@@ -337,11 +344,18 @@ impl Application for App {
                 shift,
                 ..
             } if !self.buttons.is_empty() => {
-                self.focused = if shift {
-                    (self.focused + self.buttons.len() - 1) % self.buttons.len()
-                } else {
-                    (self.focused + 1) % self.buttons.len()
+                let len = self.buttons.len();
+                let index = match self
+                    .buttons
+                    .iter()
+                    .position(|(action, _)| *action == self.focused)
+                {
+                    Some(index) if shift => (index + len - 1) % len,
+                    Some(index) => (index + 1) % len,
+                    None if shift => len - 1,
+                    None => 0,
                 };
+                self.focused = self.buttons[index].0;
                 true
             }
             PlatformEvent::Key {
@@ -349,15 +363,18 @@ impl Application for App {
                 pressed: true,
                 ..
             } => {
-                if let Some((action, _)) = self.buttons.get(self.focused) {
-                    self.activate(*action);
+                if self
+                    .buttons
+                    .iter()
+                    .any(|(action, _)| *action == self.focused)
+                {
+                    self.activate(self.focused);
                 }
                 true
             }
             PlatformEvent::FileDropped { paths, .. } if !self.writing => {
                 if let Some(path) = paths.into_iter().next() {
-                    self.image = Some(path.into());
-                    self.status = "Image selected. Choose the target disk.".into();
+                    self.select_image(path.into());
                 }
                 true
             }
@@ -511,11 +528,15 @@ impl Application for App {
             self.allow_large,
             scale,
         );
+        let write_label = match self.selected.and_then(|index| self.disks.get(index)) {
+            Some(disk) => format!("Write to disk {}...", disk.number),
+            None => "Write image...".into(),
+        };
         self.button(
             &mut frame,
             Action::Write,
             [width - 190.0, 465.0, 162.0, 38.0],
-            "Write image...",
+            &write_label,
             true,
             scale,
         );
@@ -556,5 +577,60 @@ impl Application for App {
 }
 
 pub fn run() -> Result<(), String> {
-    run_app(App::new()).map_err(|error| error.to_string())
+    let mut app = App::new();
+    app.refresh();
+    run_app(app).map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_navigation_preserves_focus_and_a_new_image_clears_the_target() {
+        let mut app = App::new();
+        app.disks = (0..5)
+            .map(|number| Disk {
+                number,
+                size: 1024,
+                model: "Test disk".into(),
+            })
+            .collect();
+        app.selected = Some(0);
+        app.bytes_written = 512;
+        app.focused = Action::Next;
+        let frame = FrameContext {
+            window: WindowId(1),
+            logical_width: 900.0,
+            logical_height: 680.0,
+            scale_factor: 1.0,
+        };
+        let key = |key| PlatformEvent::Key {
+            window: WindowId(1),
+            key,
+            pressed: true,
+            shift: false,
+            ctrl: false,
+            alt: false,
+            meta: false,
+            repeat: false,
+            text: None,
+            character: None,
+        };
+
+        app.frame(frame.clone());
+        assert!(app.event(key(PlatformKey::Enter)));
+        assert_eq!(app.page, 1);
+        app.frame(frame);
+        assert!(app.event(key(PlatformKey::Tab)));
+        assert!(app.focused == Action::AllowLarge);
+
+        assert!(app.event(PlatformEvent::FileDropped {
+            window: WindowId(1),
+            paths: vec!["second.img".into()]
+        }));
+        assert_eq!(app.image, Some(PathBuf::from("second.img")));
+        assert_eq!(app.selected, None);
+        assert_eq!(app.bytes_written, 0);
+    }
 }
