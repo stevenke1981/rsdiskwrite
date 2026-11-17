@@ -5,7 +5,7 @@ use std::os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle};
 use std::path::Path;
 use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
-    FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, GetDriveTypeW,
+    FILE_SHARE_READ, FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, GetDriveTypeW,
     GetVolumeNameForVolumeMountPointW, GetVolumePathNameW,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
@@ -218,18 +218,35 @@ fn lock_target_volumes(number: u32) -> Result<Vec<File>, String> {
     }
     Ok(locked)
 }
-fn prepare_image(path: &Path, temp_dir: &Path) -> Result<(File, u64), String> {
-    let file = File::open(path).map_err(|e| format!("Cannot open image: {e}"))?;
+fn prepare_image(
+    path: &Path,
+    capacity: u64,
+    create_temp: impl FnOnce() -> Result<File, String>,
+) -> Result<(File, u64), String> {
+    // Keep the source stable while reading it. Sharing only reads also blocks replacement.
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(path)
+        .map_err(|e| {
+            format!("Cannot open image for reading (close any program modifying it): {e}")
+        })?;
     let mut reader = BufReader::new(file);
     let mut magic = [0u8; 2];
     let read = reader.read(&mut magic).map_err(|e| e.to_string())?;
     reader.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
     let mut prepared = if read == 2 && magic == [0x1f, 0x8b] {
-        let mut temp = tempfile::tempfile_in(temp_dir)
-            .map_err(|e| format!("Cannot create temporary image: {e}"))?;
+        let mut temp = create_temp()?;
+        let mut remaining = capacity;
         loop {
-            io::copy(&mut GzDecoder::new(&mut reader), &mut temp)
+            // Allow one extra byte to detect oversized images while still checking the gzip
+            // trailer when the decompressed size is exactly the remaining capacity.
+            let mut member = GzDecoder::new(&mut reader).take(remaining.saturating_add(1));
+            let decoded = io::copy(&mut member, &mut temp)
                 .map_err(|e| format!("Cannot decompress image: {e}"))?;
+            remaining = remaining.checked_sub(decoded).ok_or_else(|| {
+                format!("Decompressed image exceeds disk capacity ({capacity} bytes)")
+            })?;
             let mut next = [0u8; 2];
             let first = reader.read(&mut next[..1]).map_err(|e| e.to_string())?;
             let second = if first == 1 {
@@ -249,6 +266,11 @@ fn prepare_image(path: &Path, temp_dir: &Path) -> Result<(File, u64), String> {
         reader.into_inner()
     };
     let size = prepared.metadata().map_err(|e| e.to_string())?.len();
+    if size > capacity {
+        return Err(format!(
+            "Image ({size} bytes) exceeds disk capacity ({capacity} bytes)"
+        ));
+    }
     prepared
         .seek(SeekFrom::Start(0))
         .map_err(|e| e.to_string())?;
@@ -267,7 +289,7 @@ fn copy_image(
     let mut buffer = vec![0u8; (1024 * 1024 / sector) * sector];
     let mut count = 0;
     while count < total {
-        let take = ((total - count) as usize).min(buffer.len());
+        let take = (total - count).min(buffer.len() as u64) as usize;
         source.read_exact(&mut buffer[..take])?;
         target.write_all(&buffer[..take])?;
         count += take as u64;
@@ -292,19 +314,15 @@ pub fn write_image(
     if volume_disks(image)?.contains(&disk.number) {
         return Err("Refusing to overwrite the disk containing the source image".into());
     }
-    let temp_dir = std::env::temp_dir();
-    if volume_disks(&temp_dir)?.contains(&disk.number) {
-        return Err(
-            "Refusing to overwrite the disk containing the temporary image directory".into(),
-        );
-    }
-    let (mut source, size) = prepare_image(image, &temp_dir)?;
-    if size > disk.size {
-        return Err(format!(
-            "Image ({size} bytes) exceeds disk capacity ({} bytes)",
-            disk.size
-        ));
-    }
+    let (mut source, size) = prepare_image(image, disk.size, || {
+        let temp_dir = std::env::temp_dir();
+        if volume_disks(&temp_dir)?.contains(&disk.number) {
+            return Err(
+                "Refusing to overwrite the disk containing the temporary image directory".into(),
+            );
+        }
+        tempfile::tempfile_in(temp_dir).map_err(|e| format!("Cannot create temporary image: {e}"))
+    })?;
     let _locked_volumes = lock_target_volumes(disk.number)?;
     let mut target = open_disk(disk.number, true).map_err(|e| format!("Cannot open disk for writing; run as Administrator and close applications using it: {e}"))?;
     let current =
@@ -336,6 +354,11 @@ pub fn write_image(
 mod tests {
     use super::*;
     use flate2::{Compression, write::GzEncoder};
+
+    fn temp_file() -> Result<File, String> {
+        tempfile::tempfile().map_err(|e| e.to_string())
+    }
+
     #[test]
     fn gzip_magic_and_trailing_signature_are_handled() {
         let mut temp = tempfile::NamedTempFile::new().unwrap();
@@ -343,7 +366,8 @@ mod tests {
         gzip.write_all(&vec![42u8; 1024]).unwrap();
         temp.write_all(&gzip.finish().unwrap()).unwrap();
         temp.write_all(b"signature").unwrap();
-        let (mut image, size) = prepare_image(temp.path(), &std::env::temp_dir()).unwrap();
+        let temp = temp.into_temp_path();
+        let (mut image, size) = prepare_image(&temp, 1024, temp_file).unwrap();
         let mut bytes = Vec::new();
         image.read_to_end(&mut bytes).unwrap();
         assert_eq!(size, 1024);
@@ -357,7 +381,8 @@ mod tests {
             gzip.write_all(part).unwrap();
             file.write_all(&gzip.finish().unwrap()).unwrap();
         }
-        let (mut image, size) = prepare_image(file.path(), &std::env::temp_dir()).unwrap();
+        let file = file.into_temp_path();
+        let (mut image, size) = prepare_image(&file, u64::MAX, temp_file).unwrap();
         let mut bytes = Vec::new();
         image.read_to_end(&mut bytes).unwrap();
         assert_eq!(size, 11);
@@ -374,12 +399,56 @@ mod tests {
         let mut next = GzEncoder::new(Vec::new(), Compression::default());
         next.write_all(b"next").unwrap();
         file.write_all(&next.finish().unwrap()).unwrap();
-        let (mut image, size) = prepare_image(file.path(), &std::env::temp_dir()).unwrap();
+        let file = file.into_temp_path();
+        let (mut image, size) = prepare_image(&file, u64::MAX, temp_file).unwrap();
         let mut bytes = Vec::new();
         image.read_to_end(&mut bytes).unwrap();
         assert_eq!(size, 8172);
         assert_eq!(&bytes[8168..], b"next");
     }
+    #[test]
+    fn raw_image_excludes_other_writers_while_prepared() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.img");
+        std::fs::write(&path, [42u8; 512]).unwrap();
+        let (source, _) =
+            prepare_image(&path, 512, || panic!("raw image used a temp file")).unwrap();
+        assert!(OpenOptions::new().write(true).open(&path).is_err());
+        drop(source);
+        assert!(OpenOptions::new().write(true).open(&path).is_ok());
+    }
+
+    #[test]
+    fn gzip_capacity_is_enforced_across_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.gz");
+        let output = dir.path().join("output.img");
+        let mut source = File::create(&path).unwrap();
+        for _ in 0..2 {
+            let mut gzip = GzEncoder::new(&mut source, Compression::default());
+            gzip.write_all(&[42u8; 1024]).unwrap();
+            gzip.finish().unwrap();
+        }
+        drop(source);
+        let error = prepare_image(&path, 1536, || {
+            File::create(&output).map_err(|e| e.to_string())
+        })
+        .unwrap_err();
+        assert!(error.contains("exceeds disk capacity"), "{error}");
+        assert_eq!(std::fs::metadata(output).unwrap().len(), 1537);
+        assert_eq!(prepare_image(&path, 2048, temp_file).unwrap().1, 2048);
+
+        let mut corrupt = std::fs::read(&path).unwrap();
+        let crc = corrupt.len() - 8;
+        corrupt[crc] ^= 1;
+        std::fs::write(&path, corrupt).unwrap();
+        assert!(
+            prepare_image(&path, 2048, temp_file)
+                .unwrap_err()
+                .contains("Cannot decompress")
+        );
+    }
+
     #[test]
     fn copy_detects_short_input() {
         let mut dest = Vec::new();
