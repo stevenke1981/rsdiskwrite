@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.2.1] - 2026-11-21
+
+### Changed
+- CI and release workflows use `actions/checkout@v7` (Node 24), removing the Node.js 20 deprecation warning. No changes to the binary's behavior.
+
 ## [0.2.0] - 2026-11-20
 
 ### Added
@@ -41,5 +46,6 @@ All notable changes to this project are documented here. The format follows [Kee
 - Raw and gzip images detected by content; concatenated gzip members and trailing data tolerated.
 - Refusal of the Windows system disk, the source-image disk and (for gzip) the temp-directory disk; 2 GiB default disk-size limit; identity re-check; volume locking; typed `ERASE <N>` confirmation.
 
+[0.2.1]: https://github.com/stevenke1981/rsdiskwrite/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/stevenke1981/rsdiskwrite/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/stevenke1981/rsdiskwrite/releases/tag/v0.1.0
