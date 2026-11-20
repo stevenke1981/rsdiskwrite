@@ -13,6 +13,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::cell::Cell;
 use std::io::{self, BufRead, IsTerminal, Write};
+use std::time::Instant;
 
 /// Version of the JSON envelope (`"schema"`).
 pub const SCHEMA_VERSION: u32 = 1;
@@ -219,6 +220,24 @@ impl Output {
             .map_err(|e| Error::io("cannot write to stdout", e))
     }
 
+    /// Like [`Output::error`], but in JSON mode the error object also carries
+    /// `"details"` (e.g. the verify report or the refused plan) so agents get the full
+    /// picture from the one stdout object. Human mode prints the same as `error`.
+    pub fn error_with_details<T: Serialize + ?Sized>(&self, error: &Error, details: &T) {
+        if self.json {
+            let mut value = envelope_err(error);
+            if let (Some(obj), Ok(details)) = (
+                value.get_mut("error").and_then(Value::as_object_mut),
+                serde_json::to_value(details),
+            ) {
+                obj.insert("details".into(), details);
+            }
+            let _ = writeln!(io::stdout().lock(), "{value}");
+        } else {
+            self.error(error);
+        }
+    }
+
     /// Renders an error: JSON envelope on stdout in JSON mode, otherwise
     /// `rsdiskwrite: error: ...` (+ `hint: ...`) on stderr. Never fails.
     pub fn error(&self, error: &Error) {
@@ -278,6 +297,7 @@ impl Output {
             mode: self.progress,
             last: Cell::new(None),
             drawn: Cell::new(false),
+            started: Cell::new(None),
         }
     }
 }
@@ -289,6 +309,55 @@ pub struct ProgressSink {
     /// Last (phase, permille) rendered.
     last: Cell<Option<(Phase, u64)>>,
     drawn: Cell<bool>,
+    /// When the current phase started rendering (for speed and ETA).
+    started: Cell<Option<(Phase, Instant)>>,
+}
+
+/// Human duration: `"0:07"`, `"12:03"`, `"1:02:03"`.
+pub fn format_duration(seconds: u64) -> String {
+    let (h, m, s) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+/// One progress-bar line (without carriage return): phase, percent, bar, sizes, MiB/s
+/// and ETA. `elapsed` is the time spent in this phase.
+pub fn format_bar_line(progress: Progress, elapsed: std::time::Duration) -> String {
+    const WIDTH: usize = 24;
+    let permille = (progress.done.saturating_mul(1000))
+        .checked_div(progress.total)
+        .unwrap_or(0)
+        .min(1000);
+    let filled = (permille as usize * WIDTH) / 1000;
+    let bar = format!("{}{}", "#".repeat(filled), "-".repeat(WIDTH - filled));
+    let secs = elapsed.as_secs_f64();
+    let rate = if secs > 0.2 {
+        progress.done as f64 / secs
+    } else {
+        0.0
+    };
+    let speed = if rate > 0.0 {
+        format!("{:.1} MiB/s", rate / (1024.0 * 1024.0))
+    } else {
+        "-- MiB/s".to_owned()
+    };
+    let eta = if rate > 0.0 && progress.total > progress.done {
+        format_duration(((progress.total - progress.done) as f64 / rate).ceil() as u64)
+    } else if progress.total > 0 && progress.done >= progress.total {
+        "0:00".to_owned()
+    } else {
+        "--:--".to_owned()
+    };
+    format!(
+        "{:<9} {:>5.1}% [{bar}] {} / {}  {speed}  ETA {eta}   ",
+        phase_name(progress.phase),
+        permille as f64 / 10.0,
+        format_size(progress.done),
+        format_size(progress.total)
+    )
 }
 
 fn phase_name(phase: Phase) -> &'static str {
@@ -331,15 +400,16 @@ impl ProgressSink {
             ),
             _ => {
                 self.drawn.set(true);
-                write!(
-                    stderr,
-                    "\r{:<9} {:>5.1}%  {} / {}   ",
-                    phase_name(progress.phase),
-                    permille as f64 / 10.0,
-                    format_size(progress.done),
-                    format_size(progress.total)
-                )
-                .and_then(|_| stderr.flush())
+                let started = match self.started.get() {
+                    Some((phase, at)) if phase == progress.phase => at,
+                    _ => {
+                        let now = Instant::now();
+                        self.started.set(Some((progress.phase, now)));
+                        now
+                    }
+                };
+                write!(stderr, "\r{}", format_bar_line(progress, started.elapsed()))
+                    .and_then(|_| stderr.flush())
             }
         };
     }
@@ -379,6 +449,35 @@ mod tests {
             envelope_err(&error),
             json!({"schema": 1, "ok": false, "error": {"code": "disk_not_found", "message": "gone", "hint": null}})
         );
+    }
+
+    #[test]
+    fn bar_line_and_duration() {
+        use std::time::Duration;
+        assert_eq!(format_duration(7), "0:07");
+        assert_eq!(format_duration(723), "12:03");
+        assert_eq!(format_duration(3723), "1:02:03");
+        let line = format_bar_line(
+            Progress {
+                phase: Phase::Writing,
+                done: 50 * 1024 * 1024,
+                total: 100 * 1024 * 1024,
+            },
+            Duration::from_secs(5),
+        );
+        assert!(line.contains("50.0%"), "{line}");
+        assert!(line.contains("10.0 MiB/s"), "{line}");
+        assert!(line.contains("ETA 0:05"), "{line}");
+        assert!(line.contains("############------------"), "{line}");
+        let start = format_bar_line(
+            Progress {
+                phase: Phase::Hashing,
+                done: 0,
+                total: 0,
+            },
+            Duration::ZERO,
+        );
+        assert!(start.contains("ETA --:--"), "{start}");
     }
 
     #[test]

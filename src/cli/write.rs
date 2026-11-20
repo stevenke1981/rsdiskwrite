@@ -5,7 +5,7 @@ use crate::confirm;
 use crate::disk;
 use crate::error::{Error, ErrorKind, Result};
 use crate::ops::{self, WritePlan, WriteReport, WriteRequest};
-use crate::output::{Output, Style, format_size};
+use crate::output::{Output, Style, format_duration, format_size};
 use std::io::IsTerminal;
 
 /// Plans, confirms and executes a write.
@@ -39,10 +39,14 @@ pub fn run(args: WriteArgs, out: &Output) -> Result<()> {
     };
     let plan = ops::plan(&request)?;
     if !plan.is_allowed() {
-        if !out.is_json() {
+        let error = refusal_error(&plan);
+        if out.is_json() {
+            out.error_with_details(&error, &plan);
+        } else {
             out.emit(&plan, render_plan)?;
+            out.error(&error);
         }
-        return Err(refusal_error(&plan));
+        return Err(error.into_reported());
     }
     if args.dry_run {
         return out.emit(&plan, render_plan);
@@ -59,16 +63,29 @@ pub fn run(args: WriteArgs, out: &Output) -> Result<()> {
                     "confirmation phrase does not match; expected '{}'",
                     confirm::phrase(&plan.disk)
                 ),
-            ));
+            )
+            .with_hint(format!(
+                "Pass --confirm \"{}\" exactly (case-sensitive), or omit --confirm to be asked at a terminal",
+                confirm::phrase(&plan.disk)
+            )));
         }
         None if interactive => {
+            if !out.is_quiet() {
+                eprintln!("{}", plan_text(&plan, out, false));
+            }
             let prompt = out.paint_err(
                 &confirm::warning(&plan.disk, &plan.image.path),
                 Style::Yellow,
             );
             let answer = out.prompt(&prompt)?;
             if !confirm::matches(&answer, &plan.disk) {
-                return Err(Error::new(ErrorKind::NotConfirmed, "cancelled"));
+                return Err(
+                    Error::new(ErrorKind::NotConfirmed, "cancelled: nothing was written")
+                        .with_hint(format!(
+                            "Type exactly {} to confirm",
+                            confirm::phrase(&plan.disk)
+                        )),
+                );
             }
         }
         None => {
@@ -86,6 +103,11 @@ pub fn run(args: WriteArgs, out: &Output) -> Result<()> {
     let report = ops::execute(&plan, &|p| sink.update(p));
     sink.finish();
     let report = report?;
+    if let Some(verify) = report.verify.as_ref().filter(|v| !v.matched) {
+        let error = crate::cli::verify::mismatch_error(verify);
+        out.error_with_details(&error, &report);
+        return Err(error.into_reported());
+    }
     out.emit(&report, render_report)
 }
 
@@ -117,25 +139,54 @@ fn refusal_error(plan: &WritePlan) -> Error {
 
 /// Human rendering of a plan (dry run or refusal).
 pub fn render_plan(plan: &WritePlan, out: &Output) -> String {
+    plan_text(plan, out, true)
+}
+
+fn plan_text(plan: &WritePlan, out: &Output, final_line: bool) -> String {
+    let label = |text: &str| out.paint(&format!("{text:<8}"), Style::Bold);
+    let disk = &plan.disk;
     let mut text = format!(
-        "{} {} ({:?}, {})\n{} {}",
-        out.paint("Image:", Style::Bold),
+        "{} {} ({:?}, {})",
+        label("Image:"),
         plan.image.path.display(),
         plan.image.format,
-        format_size(plan.image.file_size),
-        out.paint("Target:", Style::Bold),
-        plan.disk.summary()
+        format_size(plan.image.file_size)
     );
     if let Some(sha) = plan.image.sha256 {
-        text.push_str(&format!("\n{} {sha}", out.paint("SHA-256:", Style::Bold)));
+        text.push_str(&format!("\n{} {sha}", label("SHA-256:")));
     }
+    text.push_str(&format!(
+        "\n{} {} - {} ({} bytes), {}{}{}",
+        label("Target:"),
+        disk.name(),
+        format_size(disk.size),
+        disk.size,
+        disk.bus.label(),
+        if disk.removable { ", removable" } else { "" },
+        if disk.is_system { ", SYSTEM" } else { "" },
+    ));
+    text.push_str(&format!(
+        "\n{} {}{}",
+        label("Device:"),
+        disk.model,
+        disk.serial
+            .as_deref()
+            .map(|s| format!(", serial {s}"))
+            .unwrap_or_default()
+    ));
+    text.push_str(&format!(
+        "\n{} {}",
+        label("Verify:"),
+        if plan.request.verify {
+            "read back and compare after writing"
+        } else {
+            "skipped (--no-verify)"
+        }
+    ));
     for warning in &plan.warnings {
-        text.push_str(&format!("\n{} {warning}", out.paint("note:", Style::Cyan)));
-    }
-    if plan.refusals.is_empty() {
         text.push_str(&format!(
-            "\n{} all safety checks passed; nothing was written",
-            out.paint("OK:", Style::Green)
+            "\n{} {warning}",
+            out.paint("warning:", Style::Yellow)
         ));
     }
     for refusal in &plan.refusals {
@@ -144,22 +195,52 @@ pub fn render_plan(plan: &WritePlan, out: &Output) -> String {
             out.paint("REFUSED:", Style::Red),
             refusal.message
         ));
+        if let Some(hint) = &refusal.hint {
+            text.push_str(&format!("\n  {} {hint}", out.paint("hint:", Style::Cyan)));
+        }
+    }
+    if plan.refusals.is_empty() && final_line {
+        text.push_str(&format!(
+            "\n{} all safety checks passed; nothing was written (dry run)",
+            out.paint("OK:", Style::Green)
+        ));
     }
     text
 }
 
-/// Human rendering of a successful write.
+/// Human rendering of a successful write: bytes, time, speed and verify result.
 pub fn render_report(report: &WriteReport, out: &Output) -> String {
+    let secs = report.elapsed_ms as f64 / 1000.0;
+    let speed = if secs > 0.0 {
+        format!(
+            ", {:.1} MiB/s",
+            report.bytes_written as f64 / secs / (1024.0 * 1024.0)
+        )
+    } else {
+        String::new()
+    };
     let mut text = format!(
-        "{} {} bytes written to {}.",
+        "{} wrote {} ({} bytes) to {} in {}{speed}.",
         out.paint("Done:", Style::Green),
+        format_size(report.bytes_written),
         report.bytes_written,
-        report.disk.name()
+        report.disk.name(),
+        format_duration(report.elapsed_ms / 1000)
     );
     match &report.verify {
-        Some(verify) if verify.matched => text.push_str(" Verified."),
-        Some(_) => text.push_str(" Verification FAILED."),
-        None => {}
+        Some(verify) if verify.matched => text.push_str(&format!(
+            "\n{} read back {} bytes; disk matches the image.",
+            out.paint("Verified:", Style::Green),
+            verify.bytes
+        )),
+        Some(_) => text.push_str(&format!(
+            "\n{} disk differs from the image.",
+            out.paint("Verification FAILED:", Style::Red)
+        )),
+        None => text.push_str("\nVerification: skipped."),
+    }
+    if let Some(sha) = report.content_sha256 {
+        text.push_str(&format!("\nSHA-256 of data: {sha}"));
     }
     text
 }
