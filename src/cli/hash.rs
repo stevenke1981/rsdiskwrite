@@ -45,8 +45,8 @@ pub fn run(args: HashArgs, out: &Output) -> Result<()> {
         }
         (None, Some(disk)) => {
             let size = crate::disk::get(disk)?.size;
-            let bytes = args.length.map_or(size, |len| len.min(size));
-            let digest = ops::hash_disk(disk, Some(bytes), &|p| sink.update(p));
+            let bytes = args.length.unwrap_or(size);
+            let digest = ops::hash_disk(disk, args.length, &|p| sink.update(p));
             sink.finish();
             HashData {
                 image: None,

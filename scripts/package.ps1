@@ -7,12 +7,18 @@ pwsh -File scripts/package.ps1 -Version 0.1.0
 [CmdletBinding()]
 param(
     [string]$Version,
-    [string]$Target = 'x86_64-pc-windows-msvc',
+    [string]$Target,
     [string]$BinaryPath
 )
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
+
+if (-not $Target) {
+    $Target = 'x86_64-pc-windows-msvc'
+    $hostLine = (& rustc -vV 2>$null) | Where-Object { $_ -like 'host:*' } | Select-Object -First 1
+    if ($hostLine) { $Target = ($hostLine -replace '^host:\s*', '').Trim() }
+}
 
 if (-not $Version) {
     $cargoToml = Get-Content -LiteralPath (Join-Path $root 'Cargo.toml') -Raw

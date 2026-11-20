@@ -21,6 +21,7 @@ All notable changes to this project are documented here. The format follows [Kee
 - Shell completions (`completions <shell>`).
 - GUI: verify and allow-fixed toggles, disk identity rows, refusal display, per-phase percent progress.
 - Release workflow (tag `v*`): zip, bare exe and `SHA256SUMS.txt` on GitHub Releases; MSRV (1.88) CI job; build cache.
+- `completions --json` wraps the script in the envelope; `hash --disk --length` no longer silently clamps; strict hex parsing for digests; `mcp serve` errors go to stderr only; the GUI releases its own auto-created console; release workflow runs tests; `package.ps1` defaults `-Target` to the rustc host.
 - Documentation: README rewrite, docs/CLI.md, docs/MCP.md, docs/SAFETY.md, AGENTS.md, CHANGELOG.
 
 ### Changed

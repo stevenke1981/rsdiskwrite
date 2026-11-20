@@ -43,6 +43,10 @@ jobs:
           if (-not $pkg) { throw 'Package rsdiskwrite not found in cargo metadata' }
           if ($tagVersion -ne $pkg.version) { throw "Tag version '$tagVersion' does not match Cargo.toml version '$($pkg.version)'" }
           Add-Content -Path $env:GITHUB_ENV -Value "VERSION=$tagVersion"
+      - name: Run tests
+        run: |
+          cargo test --locked
+          if ($LASTEXITCODE -ne 0) { throw "cargo test failed with exit code $LASTEXITCODE" }
       - name: Build release binary
         run: |
           cargo build --release --locked

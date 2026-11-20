@@ -60,7 +60,7 @@ Flow: plan (all refusals, exit 3 before any prompt) -> confirmation -> with `--e
 `rsdiskwrite gui` opens the graphical interface (same as no arguments).
 
 ### completions
-`rsdiskwrite completions bash|elvish|fish|powershell|zsh` prints a completion script, e.g. `rsdiskwrite completions powershell >> $PROFILE`.
+`rsdiskwrite completions bash|elvish|fish|powershell|zsh` prints a completion script, e.g. `rsdiskwrite completions powershell >> $PROFILE`. With `--json` the script is wrapped as `{"shell":...,"script":...}` in the envelope.
 
 ## Exit codes
 
