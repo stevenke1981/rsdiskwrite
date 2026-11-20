@@ -21,9 +21,20 @@ fn main() {
             error.exit();
         }
     };
+    let serve = matches!(
+        &cli.command,
+        Some(cli::Command::Mcp(cli::McpArgs {
+            command: cli::McpCommand::Serve(_)
+        }))
+    );
     let out = Output::new(cli.global.json, cli.global.quiet, cli.global.color);
     if let Err(error) = cli::run(cli, &out) {
-        if !error.reported {
+        if serve {
+            // MCP stdout carries only JSON-RPC; never emit an envelope there.
+            if !error.reported {
+                eprintln!("error: {error}");
+            }
+        } else if !error.reported {
             out.error(&error);
         }
         std::process::exit(i32::from(error.exit_code()));

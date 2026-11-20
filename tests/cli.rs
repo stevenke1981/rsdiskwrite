@@ -225,6 +225,20 @@ fn completions_for_every_shell_are_non_empty() {
 }
 
 #[test]
+fn completions_json_wraps_script() {
+    let output = run(&["completions", "bash", "--json"]);
+    assert_eq!(output.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_str(stdout(&output).trim()).unwrap();
+    assert_eq!(v["data"]["shell"], "bash");
+    assert!(
+        v["data"]["script"]
+            .as_str()
+            .unwrap()
+            .contains("rsdiskwrite")
+    );
+}
+
+#[test]
 fn usage_errors_exit_two() {
     assert_eq!(run(&["hash"]).status.code(), Some(2));
     assert_eq!(run(&["verify", "x.img"]).status.code(), Some(2));

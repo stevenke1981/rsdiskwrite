@@ -88,7 +88,7 @@ pub fn parse_hex(text: &str) -> Result<Digest> {
             format!("invalid SHA-256 digest '{text}': expected 64 hex digits"),
         )
     };
-    if text.len() != 64 || !text.is_ascii() {
+    if text.len() != 64 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(invalid());
     }
     let mut out = [0u8; 32];
@@ -147,6 +147,12 @@ pub fn sha256_file(path: &Path, progress: &dyn Fn(u64)) -> Result<Digest> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parse_hex_rejects_sign_prefix() {
+        let text = format!("+{}", "a".repeat(63));
+        assert!(super::parse_hex(&text).is_err());
+    }
+
     use super::*;
 
     const ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
