@@ -11,7 +11,7 @@ use crate::ops::{Phase, Progress};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::io::{BufRead, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -25,7 +25,18 @@ pub struct ServerConfig {
     pub confirmer: Arc<dyn Confirmer>,
     /// `plan_id` lifetime.
     pub plan_ttl: Duration,
+    /// Suppress the diagnostic log lines normally written to stderr (used by the
+    /// in-process `doctor` self-test).
+    pub quiet: bool,
 }
+
+/// Longest accepted input line (one JSON-RPC message), newline included. Longer lines are
+/// discarded and answered with `-32600`; the server keeps serving.
+pub const MAX_LINE_BYTES: usize = 1024 * 1024;
+
+/// Most `tools/call` requests (other than `write_image`) running at once; more are
+/// answered with a `busy` tool error.
+pub const MAX_CONCURRENT_CALLS: usize = 4;
 
 impl ServerConfig {
     /// Production configuration: dialog confirmer and [`PLAN_TTL`].
@@ -34,6 +45,7 @@ impl ServerConfig {
             allow_write,
             confirmer: Arc::new(DialogConfirmer),
             plan_ttl: PLAN_TTL,
+            quiet: false,
         }
     }
 }
@@ -43,6 +55,7 @@ impl std::fmt::Debug for ServerConfig {
         f.debug_struct("ServerConfig")
             .field("allow_write", &self.allow_write)
             .field("plan_ttl", &self.plan_ttl)
+            .field("quiet", &self.quiet)
             .finish_non_exhaustive()
     }
 }
@@ -55,6 +68,10 @@ impl std::fmt::Debug for ServerConfig {
 /// writes run on a worker thread so `ping` stays responsive, which is why `writer` must be
 /// `Send + 'static`. Returns `Ok(())` on EOF; I/O errors on `writer` end the loop with
 /// [`crate::ErrorKind::Io`].
+///
+/// Input lines longer than [`MAX_LINE_BYTES`] are answered with `-32600`; at most
+/// [`MAX_CONCURRENT_CALLS`] read-only tool calls run at once and `verify_disk` is refused
+/// while a write runs (both answered with a `busy` tool error).
 ///
 /// Every `tools/call` runs on its own worker thread, so responses may arrive out of
 /// order (match them by id). Before returning, the server waits for running tool calls
@@ -80,27 +97,44 @@ fn serve_with_store<R: BufRead, W: Write + Send + 'static>(
         config,
         plans,
         writing: Arc::new(AtomicBool::new(false)),
+        calls: Arc::new(AtomicUsize::new(0)),
     };
-    log(&format!(
-        "serving MCP on stdio (write_image {})",
-        if state.config.allow_write {
-            "ENABLED"
-        } else {
-            "disabled"
-        }
-    ));
+    let quiet = state.config.quiet;
+    log(
+        quiet,
+        &format!(
+            "serving MCP on stdio (write_image {})",
+            if state.config.allow_write {
+                "ENABLED"
+            } else {
+                "disabled"
+            }
+        ),
+    );
     let mut workers: Vec<JoinHandle<()>> = Vec::new();
     let mut buffer = Vec::new();
     let result = loop {
-        buffer.clear();
-        match reader.read_until(b'\n', &mut buffer) {
-            Ok(0) => break Ok(()),
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+        let too_long = match read_capped_line(&mut reader, &mut buffer, MAX_LINE_BYTES) {
+            Ok(Line::Eof) => break Ok(()),
+            Ok(Line::Complete) => false,
+            Ok(Line::TooLong) => true,
             Err(e) => break Err(Error::io("cannot read from the MCP client", e)),
-        }
+        };
         workers.retain(|worker| !worker.is_finished());
         let reply = match std::str::from_utf8(&buffer) {
+            _ if too_long => {
+                log(quiet, "discarded an oversized input line");
+                Some(Response::error(
+                    None,
+                    RpcError::new(
+                        codes::INVALID_REQUEST,
+                        format!(
+                            "Request too large: messages are limited to {MAX_LINE_BYTES} bytes \
+                             per line"
+                        ),
+                    ),
+                ))
+            }
             Err(e) => Some(Response::error(
                 None,
                 RpcError::new(codes::PARSE_ERROR, format!("Parse error: {e}")),
@@ -125,8 +159,65 @@ fn serve_with_store<R: BufRead, W: Write + Send + 'static>(
     for worker in workers {
         let _ = worker.join();
     }
-    log("MCP client disconnected");
+    log(quiet, "MCP client disconnected");
     result
+}
+
+/// Outcome of [`read_capped_line`].
+#[derive(Debug, PartialEq, Eq)]
+enum Line {
+    /// End of input, nothing read.
+    Eof,
+    /// `buffer` holds one line (with its newline, unless input ended without one).
+    Complete,
+    /// The line exceeded the limit; it was consumed and discarded (`buffer` is empty).
+    TooLong,
+}
+
+/// Reads one `\n`-terminated line into `buffer`, never holding more than `max` bytes:
+/// an over-long line is consumed up to its newline and reported as [`Line::TooLong`].
+fn read_capped_line<R: BufRead>(
+    reader: &mut R,
+    buffer: &mut Vec<u8>,
+    max: usize,
+) -> std::io::Result<Line> {
+    buffer.clear();
+    let mut too_long = false;
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(available) => available,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if available.is_empty() {
+            return Ok(if too_long {
+                Line::TooLong
+            } else if buffer.is_empty() {
+                Line::Eof
+            } else {
+                Line::Complete
+            });
+        }
+        let newline = available.iter().position(|b| *b == b'\n');
+        let used = newline.map_or(available.len(), |i| i + 1);
+        if !too_long {
+            if buffer.len() + used > max {
+                too_long = true;
+                buffer.clear();
+                buffer.shrink_to(max);
+            } else {
+                buffer.extend_from_slice(&available[..used]);
+            }
+        }
+        reader.consume(used);
+        if newline.is_some() {
+            return Ok(if too_long {
+                Line::TooLong
+            } else {
+                Line::Complete
+            });
+        }
+    }
 }
 
 /// Shared server state.
@@ -136,6 +227,39 @@ struct State<W> {
     plans: Arc<PlanStore>,
     /// A `write_image` call is running.
     writing: Arc<AtomicBool>,
+    /// Number of other tool calls running.
+    calls: Arc<AtomicUsize>,
+}
+
+/// One of the [`MAX_CONCURRENT_CALLS`] tool-call slots; released when dropped.
+struct CallSlot(Arc<AtomicUsize>);
+
+impl CallSlot {
+    fn acquire(counter: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
+        // A compare-exchange loop (fetch_update is deprecated on newer toolchains and its
+        // replacement is newer than the minimum supported Rust version).
+        let mut current = counter.load(Ordering::Acquire);
+        loop {
+            if current >= limit {
+                return None;
+            }
+            match counter.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self(counter.clone())),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+impl Drop for CallSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Releases the write slot when dropped.
@@ -155,8 +279,16 @@ impl Drop for WriteSlot {
     }
 }
 
-fn log(message: &str) {
-    eprintln!("rsdiskwrite mcp: {message}");
+/// A diagnostic line on stderr (never stdout), unless `quiet`.
+fn log(quiet: bool, message: &str) {
+    if !quiet {
+        eprintln!("rsdiskwrite mcp: {message}");
+    }
+}
+
+fn busy(id: RequestId, message: &str, hint: &str) -> Response {
+    let error = Error::new(ErrorKind::Busy, message).with_hint(hint);
+    tool_result(id, &CallToolResult::failure(&error))
 }
 
 /// Writes one message as one line and flushes.
@@ -264,10 +396,11 @@ impl<W: Write + Send + 'static> State<W> {
 
     fn handle_notification(&self, notification: &Notification) {
         match notification.method.as_str() {
-            "notifications/initialized" => log("client initialized"),
-            "notifications/cancelled" => {
-                log("cancellation requested (running disk operations cannot be cancelled)")
-            }
+            "notifications/initialized" => log(self.config.quiet, "client initialized"),
+            "notifications/cancelled" => log(
+                self.config.quiet,
+                "cancellation requested (running disk operations cannot be cancelled)",
+            ),
             _ => {}
         }
     }
@@ -292,20 +425,41 @@ impl<W: Write + Send + 'static> State<W> {
             .and_then(|meta| meta.get("progressToken"))
             .filter(|token| token.is_string() || token.is_number())
             .cloned();
-        // One write at a time, decided here (not on the worker) so it is deterministic.
-        let slot = if name == names::WRITE_IMAGE && self.config.allow_write {
+        // Admission is decided here (not on the worker) so it is deterministic: one write at
+        // a time, no read-back while a write runs, and a bounded number of other calls.
+        let is_write = name == names::WRITE_IMAGE && self.config.allow_write;
+        if name == names::VERIFY_DISK && self.writing.load(Ordering::Acquire) {
+            return Some(busy(
+                id,
+                "verify_disk is unavailable while write_image is running",
+                "Wait for the write to finish (it verifies the disk itself)",
+            ));
+        }
+        let (slot, call_slot) = if is_write {
             match WriteSlot::acquire(&self.writing) {
-                Some(slot) => Some(slot),
+                Some(slot) => (Some(slot), None),
                 None => {
-                    let busy = Error::new(ErrorKind::Busy, "Another write_image call is running")
-                        .with_hint("Wait for it to finish, then plan the next write");
-                    return Some(tool_result(id, &CallToolResult::failure(&busy)));
+                    return Some(busy(
+                        id,
+                        "Another write_image call is running",
+                        "Wait for it to finish, then plan the next write",
+                    ));
                 }
             }
         } else {
-            None
+            match CallSlot::acquire(&self.calls, MAX_CONCURRENT_CALLS) {
+                Some(call_slot) => (None, Some(call_slot)),
+                None => {
+                    return Some(busy(
+                        id,
+                        &format!("Too many tool calls are running (limit {MAX_CONCURRENT_CALLS})"),
+                        "Wait for a running call to finish, then retry",
+                    ));
+                }
+            }
         };
-        log(&format!("tools/call {name}"));
+        let quiet = self.config.quiet;
+        log(quiet, &format!("tools/call {name}"));
         let out = self.out.clone();
         let plans = self.plans.clone();
         let confirmer = self.config.confirmer.clone();
@@ -314,9 +468,8 @@ impl<W: Write + Send + 'static> State<W> {
         let spawned = std::thread::Builder::new()
             .name(format!("mcp-{name}"))
             .spawn(move || {
-                let _slot = slot;
                 let id = worker_id;
-                let reporter = token.map(|token| ProgressReporter::new(token, out.clone()));
+                let reporter = token.map(|token| ProgressReporter::new(token, out.clone(), quiet));
                 let progress = |p: Progress| {
                     if let Some(reporter) = &reporter {
                         reporter.report(p);
@@ -346,8 +499,12 @@ impl<W: Write + Send + 'static> State<W> {
                         RpcError::new(codes::INTERNAL_ERROR, format!("tool '{name}' panicked")),
                     ),
                 };
+                // Free the slots before answering, so a client that waits for this response
+                // can immediately start its next call.
+                drop(slot);
+                drop(call_slot);
                 if let Err(e) = send(&out, &response) {
-                    log(&format!("cannot send the {name} result: {e}"));
+                    log(quiet, &format!("cannot send the {name} result: {e}"));
                 }
             });
         match spawned {
@@ -375,6 +532,7 @@ struct ProgressReporter<W> {
     token: Value,
     out: Arc<Mutex<W>>,
     state: Mutex<ProgressState>,
+    quiet: bool,
 }
 
 struct ProgressState {
@@ -387,10 +545,11 @@ struct ProgressState {
 }
 
 impl<W: Write> ProgressReporter<W> {
-    fn new(token: Value, out: Arc<Mutex<W>>) -> Self {
+    fn new(token: Value, out: Arc<Mutex<W>>, quiet: bool) -> Self {
         Self {
             token,
             out,
+            quiet,
             state: Mutex::new(ProgressState {
                 phase: None,
                 base: 0,
@@ -444,7 +603,7 @@ impl<W: Write> ProgressReporter<W> {
         if let Some(notification) = self.next(p)
             && let Err(e) = send(&self.out, &notification)
         {
-            log(&format!("cannot send progress: {e}"));
+            log(self.quiet, &format!("cannot send progress: {e}"));
         }
     }
 }
@@ -503,6 +662,7 @@ mod tests {
             allow_write,
             confirmer,
             plan_ttl: PLAN_TTL,
+            quiet: true,
         }
     }
 
@@ -739,6 +899,14 @@ mod tests {
         feed(write_call(3, &second));
         assert_eq!(error_code(&wait_for(3)), "busy");
         assert_eq!(plans.len(), 1, "a busy call does not consume its plan");
+        feed(json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                    "params": {"name": "verify_disk",
+                               "arguments": {"image": "x.img", "disk": 9999}}}));
+        assert_eq!(
+            error_code(&wait_for(4)),
+            "busy",
+            "no read-back during a write"
+        );
         release_tx.send(()).unwrap();
         assert_eq!(error_code(&wait_for(1)), "not_confirmed");
         drop(line_tx);
@@ -746,9 +914,116 @@ mod tests {
     }
 
     #[test]
+    fn capped_lines_are_discarded_up_to_their_newline() {
+        // A 4-byte buffer makes lines span several fill_buf calls.
+        let input = b"ab\n0123456789\nxyz\n0123456789".to_vec();
+        let mut reader = std::io::BufReader::with_capacity(4, Cursor::new(input));
+        let mut buffer = Vec::new();
+        let mut next = || {
+            let line = read_capped_line(&mut reader, &mut buffer, 6).unwrap();
+            (line, String::from_utf8(buffer.clone()).unwrap())
+        };
+        assert_eq!(next(), (Line::Complete, "ab\n".into()));
+        assert_eq!(next(), (Line::TooLong, String::new()));
+        assert_eq!(next(), (Line::Complete, "xyz\n".into()));
+        assert_eq!(
+            next(),
+            (Line::TooLong, String::new()),
+            "unterminated at EOF"
+        );
+        assert_eq!(next(), (Line::Eof, String::new()));
+    }
+
+    #[test]
+    fn oversized_line_is_rejected_and_the_server_keeps_serving() {
+        let mut text = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"params\":{{\"pad\":\"{}\"}}}}\n",
+            "x".repeat(MAX_LINE_BYTES)
+        );
+        text.push_str(&format!(
+            "{}\n",
+            json!({"jsonrpc": "2.0", "id": 2, "method": "ping"})
+        ));
+        let out = Buffer::default();
+        serve_with_store(
+            Cursor::new(text),
+            out.clone(),
+            config(false, Arc::new(Mock::default())),
+            Arc::new(PlanStore::default()),
+        )
+        .unwrap();
+        let lines = out.lines();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0]["id"].is_null());
+        assert_eq!(lines[0]["error"]["code"], codes::INVALID_REQUEST);
+        assert_eq!(by_id(&lines, 2)["result"], json!({}));
+    }
+
+    fn idle_state(allow_write: bool) -> State<Buffer> {
+        State {
+            out: Arc::new(Mutex::new(Buffer::default())),
+            config: config(allow_write, Arc::new(Mock::default())),
+            plans: Arc::new(PlanStore::default()),
+            writing: Arc::new(AtomicBool::new(false)),
+            calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn busy_code(reply: Option<Response>) -> Value {
+        let reply = serde_json::to_value(reply.expect("answered immediately")).unwrap();
+        error_code(&reply).clone()
+    }
+
+    #[test]
+    fn concurrent_tool_calls_are_capped() {
+        let state = idle_state(true);
+        let mut workers = Vec::new();
+        let held: Vec<CallSlot> = (0..MAX_CONCURRENT_CALLS)
+            .map(|_| CallSlot::acquire(&state.calls, MAX_CONCURRENT_CALLS).unwrap())
+            .collect();
+        let list = json!({"name": "list_disks", "arguments": {}});
+        let reply = state.call_tool(RequestId::Number(1), Some(list.clone()), &mut workers);
+        assert_eq!(busy_code(reply), "busy");
+        assert!(workers.is_empty(), "no worker was started");
+        // write_image has its own slot, so it is still admitted (this plan id is unknown, so
+        // the worker fails with plan_invalid before any dialog).
+        let reply = state.call_tool(
+            RequestId::Number(2),
+            Some(json!(
+            {"name": "write_image", "arguments": {"plan_id": "plan_unknown"}})),
+            &mut workers,
+        );
+        assert!(reply.is_none(), "handed to a worker");
+        for worker in workers.drain(..) {
+            worker.join().unwrap();
+        }
+        let answered = state.out.lock().unwrap().lines();
+        assert_eq!(error_code(by_id(&answered, 2)), "plan_invalid");
+        assert_eq!(state.calls.load(Ordering::SeqCst), MAX_CONCURRENT_CALLS);
+        drop(held);
+        assert_eq!(state.calls.load(Ordering::SeqCst), 0);
+        let held = CallSlot::acquire(&state.calls, 1).unwrap();
+        assert!(CallSlot::acquire(&state.calls, 1).is_none());
+        drop(held);
+        assert!(CallSlot::acquire(&state.calls, 1).is_some());
+    }
+
+    #[test]
+    fn verify_is_busy_while_a_write_holds_the_slot() {
+        let state = idle_state(true);
+        let mut workers = Vec::new();
+        let _write = WriteSlot::acquire(&state.writing).unwrap();
+        let verify = json!({"name": "verify_disk", "arguments": {"image": "x.img", "disk": 9999}});
+        let reply = state.call_tool(RequestId::Number(1), Some(verify), &mut workers);
+        assert_eq!(busy_code(reply), "busy");
+        assert!(workers.is_empty());
+        assert_eq!(state.calls.load(Ordering::SeqCst), 0, "no slot leaked");
+    }
+
+    #[test]
     fn progress_is_throttled_and_monotonic() {
         let out = Buffer::default();
-        let reporter = ProgressReporter::new(json!("tok"), Arc::new(Mutex::new(out.clone())));
+        let reporter = ProgressReporter::new(json!("tok"), Arc::new(Mutex::new(out.clone())), true);
         let p = |phase, done, total| Progress { phase, done, total };
         reporter.report(p(Phase::Writing, 0, 1000));
         reporter.report(p(Phase::Writing, 10, 1000)); // throttled

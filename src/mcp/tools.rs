@@ -566,15 +566,17 @@ fn write_image(args: WriteArgs, ctx: &ToolContext<'_>) -> Result<CallToolResult>
              single-use)",
         ));
     }
-    // Layer 4: re-plan now, bound to the confirmed identity and image hash, so every refusal
-    // is evaluated again; ops::execute re-checks the identity once more after locking.
+    // Layer 4: re-plan now, bound to the confirmed identity, so every refusal is evaluated
+    // again. The image hash is not recomputed here: ops::execute hashes the very handle it
+    // then writes from and compares it with the confirmed SHA-256 (so the file cannot be
+    // swapped in between), and re-checks the disk identity once more after locking.
     let mut request = stored.plan.request.clone();
     request.image = stored.plan.image.path.clone();
     request.expected = Some(stored.identity());
-    request.expect_sha256 = Some(stored.image_sha256);
-    request.hash_image = true;
+    request.expect_sha256 = None;
+    request.hash_image = false;
     request.allow_fixed = false;
-    let fresh = ops::plan(&request)?;
+    let mut fresh = ops::plan(&request)?;
     if fresh.disk.identity() != stored.identity() {
         return Err(Error::new(
             ErrorKind::IdentityChanged,
@@ -582,14 +584,8 @@ fn write_image(args: WriteArgs, ctx: &ToolContext<'_>) -> Result<CallToolResult>
         )
         .with_hint("Call list_disks and plan_write again"));
     }
-    if fresh.image.sha256 != Some(stored.image_sha256) {
-        return Err(Error::new(
-            ErrorKind::HashMismatch,
-            "The image file changed since it was planned",
-        )
-        .with_hint("Call plan_write again"));
-    }
     fresh.check()?;
+    fresh.image.sha256 = Some(stored.image_sha256);
     let progress = ctx.progress.unwrap_or(&noop_progress);
     let report: WriteReport = ops::execute(&fresh, progress)?;
     if let Some(verify) = &report.verify

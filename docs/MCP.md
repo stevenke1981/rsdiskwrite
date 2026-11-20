@@ -1,6 +1,6 @@
 # MCP server (0.2.0)
 
-`rsdiskwrite mcp serve [--allow-write]` is a Model Context Protocol server over stdio: newline-delimited JSON-RPC 2.0, one message per line. stdout carries only protocol messages; all logs go to stderr. Supported methods: `initialize` (protocol versions 2025-06-18, 2025-03-26, 2024-11-05; otherwise it answers 2025-06-18), `notifications/initialized`, `ping`, `tools/list`, `tools/call`. Unknown methods return -32601; notifications get no response; bad tool arguments return -32602.
+`rsdiskwrite mcp serve [--allow-write]` is a Model Context Protocol server over stdio: newline-delimited JSON-RPC 2.0, one message per line. stdout carries only protocol messages; all logs go to stderr. Supported methods: `initialize` (protocol versions 2025-06-18, 2025-03-26, 2024-11-05; otherwise it answers 2025-06-18), `notifications/initialized`, `ping`, `tools/list`, `tools/call`. Unknown methods return -32601; notifications get no response; bad tool arguments return -32602. Each input line may be at most 1 MiB; a longer line is discarded and answered with -32600 (null id) and the server keeps serving.
 
 Every tool result has `structuredContent` (same shape as the CLI JSON `data`) plus one text block. Failures set `isError: true` and `structuredContent = {code, message, hint}` with the same codes as the CLI ([CLI.md](CLI.md#exit-codes)). All input schemas are closed (`additionalProperties: false`).
 
@@ -17,14 +17,14 @@ Every tool result has `structuredContent` (same shape as the CLI JSON `data`) pl
 
 Annotations: all tools except `write_image` have `readOnlyHint: true`; `write_image` has `destructiveHint: true`, `idempotentHint: false`. Pass absolute paths; relative ones resolve against the server's working directory. Over MCP, fixed disks (non-removable, non-USB/SD/MMC) are never writable and `--allow-fixed` cannot be requested.
 
-Recommended agent workflow: `doctor` (if anything fails) -> `list_disks` -> show the user model/serial/size and ask which disk -> `inspect_image` -> `plan_write` (pass `expect_sha256` when the publisher gives one) -> show disk identity, warnings and refusals to the user -> `write_image` -> tell the user a dialog is waiting. `write_image` is verified by read-back automatically. Send `_meta.progressToken` to receive `notifications/progress`. Only one write runs at a time (`busy`); the write runs on a worker thread so `ping` stays responsive.
+Recommended agent workflow: `doctor` (if anything fails) -> `list_disks` -> show the user model/serial/size and ask which disk -> `inspect_image` -> `plan_write` (pass `expect_sha256` when the publisher gives one) -> show disk identity, warnings and refusals to the user -> `write_image` -> tell the user a dialog is waiting. `write_image` is verified by read-back automatically. Send `_meta.progressToken` to receive `notifications/progress`. Only one write runs at a time (`busy`); the write runs on a worker thread so `ping` stays responsive. `verify_disk` returns `busy` while a write runs, and at most 4 other tool calls run at once (further calls return `busy`; retry when one finishes).
 
 ## Write gating (four layers)
 
 1. **Opt-in.** Without `--allow-write`, `write_image` is absent from `tools/list` and calling it by name returns `safety_refusal`; `plan_write` never issues a `plan_id`.
 2. **Single-use plan.** `plan_id` is valid for 5 minutes, usable once (consumed even if the write is declined or fails), and bound to disk number, size, model, serial and the image SHA-256.
 3. **Human dialog.** The server shows a native, topmost Yes/No Windows warning box (default button **No**; Enter or closing it declines) titled "an AI agent wants to ERASE a disk" with disk identity, image path, size and SHA-256. There is no flag, environment variable or tool argument to skip it, and no confirmation phrase an agent could compute. Declined means `not_confirmed` and nothing is written.
-4. **Hard refusals and rechecks.** System, source and temp disks; fixed disks; disks over 2 GiB unless `allow_large`; oversize or misaligned images; the plan is recomputed after approval, the identity and image hash are compared with the plan, and the identity is checked again after the volumes are locked. Requires Administrator.
+4. **Hard refusals and rechecks.** System, source and temp disks; fixed disks; disks over 2 GiB unless `allow_large`; oversize or misaligned images; the plan is recomputed after approval and its disk identity compared with the plan; the image is re-hashed on the same handle it is then written from and compared with the approved SHA-256 (`hash_mismatch` otherwise); and the identity is checked again after the volumes are locked. Requires Administrator.
 
 ## Setup
 

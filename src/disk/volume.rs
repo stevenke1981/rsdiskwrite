@@ -171,6 +171,38 @@ pub fn volumes() -> Result<Vec<VolumeInfo>> {
         .collect())
 }
 
+/// Whether a volume lies on disk `target`, decided from its disk extents or, when those
+/// cannot be read (`extents == None`, e.g. an empty card-reader slot reports no media), from
+/// the volume's `IOCTL_STORAGE_GET_DEVICE_NUMBER`. `None` when neither is known: the
+/// caller must then abort rather than risk leaving a target volume mounted.
+pub(crate) fn placement(
+    extents: Option<&[u32]>,
+    device_number: Option<u32>,
+    target: u32,
+) -> Option<bool> {
+    match (extents, device_number) {
+        (Some(disks), _) => Some(disks.contains(&target)),
+        (None, Some(number)) => Some(number == target),
+        (None, None) => None,
+    }
+}
+
+/// [`placement`] for an open volume handle; errors when neither the extents nor the device
+/// number can be read.
+fn volume_on_disk(file: &File, target: u32) -> Result<bool> {
+    let extents = disk_extents(file);
+    let device_number = match &extents {
+        Ok(_) => None,
+        Err(_) => ioctl::device_number(file).ok(),
+    };
+    match placement(extents.as_deref().ok(), device_number, target) {
+        Some(on_target) => Ok(on_target),
+        None => Err(extents
+            .err()
+            .unwrap_or_else(|| Error::internal("Cannot identify volume disks"))),
+    }
+}
+
 /// `FSCTL_LOCK_VOLUME`, retried briefly because Explorer, indexers and antivirus often
 /// hold a volume open for a moment after it is mounted.
 fn lock_volume(file: &File) -> io::Result<()> {
@@ -189,7 +221,9 @@ fn lock_volume(file: &File) -> io::Result<()> {
 }
 
 /// Locks (`FSCTL_LOCK_VOLUME`) and dismounts (`FSCTL_DISMOUNT_VOLUME`) every volume on
-/// disk `number`. Fails if any volume cannot be inspected or locked (e.g. files are open);
+/// disk `number`. A volume whose extents cannot be read (no media) is placed by its device
+/// number instead. Fails if any volume cannot be placed at all, or cannot be locked (e.g.
+/// files are open);
 /// requires elevation ([`crate::ErrorKind::ElevationRequired`] otherwise). Keep the result
 /// alive for the whole write.
 pub fn lock_and_dismount(number: u32) -> Result<VolumeLocks> {
@@ -202,16 +236,15 @@ pub fn lock_and_dismount(number: u32) -> Result<VolumeLocks> {
         let device = path.trim_end_matches('\\');
         let file = ioctl::open_device(device, Access::Query)
             .map_err(|e| Error::io(format!("Cannot inspect volume {path}"), e))?;
-        let on_target = disk_extents(&file)
-            .map_err(|e| Error::new(e.kind, format!("Cannot inspect volume {path}: {e}")))?
-            .contains(&number);
+        let on_target = volume_on_disk(&file, number)
+            .map_err(|e| Error::new(e.kind, format!("Cannot inspect volume {path}: {e}")))?;
         drop(file);
         if !on_target {
             continue;
         }
         let file = ioctl::open_device(device, Access::ReadWrite)
             .map_err(|e| Error::io_elevation(format!("Cannot open target volume {path}"), e))?;
-        if !disk_extents(&file)?.contains(&number) {
+        if !volume_on_disk(&file, number)? {
             return Err(Error::new(
                 crate::ErrorKind::IdentityChanged,
                 "Target volume changed during locking",
@@ -228,4 +261,22 @@ pub fn lock_and_dismount(number: u32) -> Result<VolumeLocks> {
         locked.push(file);
     }
     Ok(VolumeLocks { handles: locked })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn volumes_are_placed_by_extents_then_device_number() {
+        // Readable extents decide, whatever the device number says.
+        assert_eq!(placement(Some(&[1, 2]), None, 2), Some(true));
+        assert_eq!(placement(Some(&[1]), Some(2), 2), Some(false));
+        // No media (extents unreadable): an empty slot on another disk is skipped...
+        assert_eq!(placement(None, Some(3), 2), Some(false));
+        // ...but one on the target still counts as on the target.
+        assert_eq!(placement(None, Some(2), 2), Some(true));
+        // Neither known: undecidable, so locking must abort.
+        assert_eq!(placement(None, None, 2), None);
+    }
 }

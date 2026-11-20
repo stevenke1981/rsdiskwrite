@@ -363,12 +363,19 @@ pub fn execute(plan: &WritePlan, progress: &dyn Fn(Progress)) -> Result<WriteRep
     plan.check()?;
     let started = std::time::Instant::now();
     let disk = &plan.disk;
+    // One handle (sharing reads only, so nobody can modify the file meanwhile) is hashed,
+    // compared with the planned SHA-256 and then prepared: what is written is exactly
+    // what was hashed.
+    let mut source = crate::image::open_source(&plan.image.path)?;
+    if let Some(expected) = plan.image.sha256 {
+        check_image_hash(&mut source, expected, plan.image.file_size, progress)?;
+    }
     progress(Progress {
         phase: Phase::Preparing,
         done: 0,
         total: plan.image.file_size,
     });
-    let mut prepared = crate::image::prepare(&plan.image.path, disk.size, || {
+    let mut prepared = crate::image::prepare_from(source, disk.size, || {
         let temp_dir = std::env::temp_dir();
         if disk::volume_disks(&temp_dir)?.contains(&disk.number) {
             return Err(Error::refusal(
@@ -422,14 +429,14 @@ pub fn execute(plan: &WritePlan, progress: &dyn Fn(Progress)) -> Result<WriteRep
             e,
         )
     })?;
-    // Ask Windows to re-read the new partition table. Advisory: the data is already on the
-    // disk, and replugging the device has the same effect, so a failure is not an error.
-    let _ = ioctl::ioctl(&target, ioctl::IOCTL_DISK_UPDATE_PROPERTIES, &[], &mut []);
     let verify = if plan.request.verify {
-        // Same handle, still holding the volume locks: what we read is what the device
-        // stores, not something a remounted file system wrote in between.
-        let first_mismatch = read_back(&mut prepared.file, &mut target, size, sector, progress)?;
+        // Same handle, still holding the volume locks, and before the partition table is
+        // re-read: no new volume can be mounted (and written to by Windows) while we read
+        // back, so what we compare is exactly what we wrote.
+        let first_mismatch = read_back(&mut prepared.file, &mut target, size, sector, progress)
+            .inspect_err(|_| refresh_partitions(&target))?;
         if let Some(offset) = first_mismatch {
+            refresh_partitions(&target);
             return Err(Error::new(
                 ErrorKind::VerifyMismatch,
                 format!(
@@ -450,6 +457,7 @@ pub fn execute(plan: &WritePlan, progress: &dyn Fn(Progress)) -> Result<WriteRep
     } else {
         None
     };
+    refresh_partitions(&target);
     Ok(WriteReport {
         disk: current,
         image: plan.image.path.clone(),
@@ -459,6 +467,62 @@ pub fn execute(plan: &WritePlan, progress: &dyn Fn(Progress)) -> Result<WriteRep
         verify,
         elapsed_ms: started.elapsed().as_millis() as u64,
     })
+}
+
+/// Asks Windows to re-read the partition table written to `target`
+/// (`IOCTL_DISK_UPDATE_PROPERTIES`), which mounts the new volumes. Called only after the
+/// read-back verification. Advisory: the data is already on the disk and replugging the
+/// device has the same effect, so a failure is ignored.
+#[cfg(windows)]
+fn refresh_partitions(target: &std::fs::File) {
+    use crate::disk::ioctl;
+    let _ = ioctl::ioctl(target, ioctl::IOCTL_DISK_UPDATE_PROPERTIES, &[], &mut []);
+}
+
+/// Hashes `source` from the start, fails with [`ErrorKind::HashMismatch`] unless the
+/// digest is `expected`, and rewinds it to offset 0. Reports [`Phase::Hashing`] progress
+/// (`total` = `file_size`).
+pub(crate) fn check_image_hash<F: std::io::Read + std::io::Seek>(
+    source: &mut F,
+    expected: Digest,
+    file_size: u64,
+    progress: &dyn Fn(Progress),
+) -> Result<()> {
+    use std::io::SeekFrom;
+    let rewind = |source: &mut F| {
+        source
+            .seek(SeekFrom::Start(0))
+            .map(|_| ())
+            .map_err(|e| Error::io("Cannot rewind image", e))
+    };
+    rewind(source)?;
+    progress(Progress {
+        phase: Phase::Hashing,
+        done: 0,
+        total: file_size,
+    });
+    let actual = crate::hash::sha256_reader(
+        std::io::BufReader::with_capacity(crate::copy::CHUNK_SIZE, &mut *source),
+        None,
+        &|done| {
+            progress(Progress {
+                phase: Phase::Hashing,
+                done,
+                total: file_size,
+            })
+        },
+    )?;
+    if actual != expected {
+        return Err(Error::new(
+            crate::error::ErrorKind::HashMismatch,
+            format!(
+                "The image file changed since it was planned: SHA-256 is {actual}, \
+                 expected {expected}"
+            ),
+        )
+        .with_hint("Plan the write again"));
+    }
+    rewind(source)
 }
 
 /// Opens a physical disk for reading or writing, mapping "access denied" to
@@ -686,6 +750,35 @@ mod tests {
             codes(&evaluate(&small, &request, odd, &[], &[])),
             [RefusalCode::ImageTooLarge, RefusalCode::SectorMisaligned]
         );
+    }
+
+    #[test]
+    fn image_hash_is_checked_on_the_given_handle_and_rewound() {
+        use std::io::{Cursor, Read};
+        let data = vec![9u8; 3000];
+        let mut hasher = crate::hash::Hasher::new();
+        hasher.update(&data);
+        let digest = hasher.finish();
+        let mut source = Cursor::new(data.clone());
+        source.set_position(17);
+        let phases = std::cell::RefCell::new(Vec::new());
+        check_image_hash(&mut source, digest, 3000, &|p| phases.borrow_mut().push(p)).unwrap();
+        assert_eq!(source.position(), 0, "rewound for preparing");
+        let mut rest = Vec::new();
+        source.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, data);
+        let phases = phases.into_inner();
+        assert!(
+            phases
+                .iter()
+                .all(|p| p.phase == Phase::Hashing && p.total == 3000)
+        );
+        assert_eq!(phases.last().unwrap().done, 3000);
+
+        let mut changed = Cursor::new(vec![8u8; 3000]);
+        let error = check_image_hash(&mut changed, digest, 3000, &|_| {}).unwrap_err();
+        assert_eq!(error.kind, crate::error::ErrorKind::HashMismatch);
+        assert_eq!(error.exit_code(), 6);
     }
 
     #[test]
