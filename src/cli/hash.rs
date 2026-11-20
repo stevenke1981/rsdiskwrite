@@ -44,17 +44,21 @@ pub fn run(args: HashArgs, out: &Output) -> Result<()> {
             }
         }
         (None, Some(disk)) => {
-            // TODO(phase2-C): report the actual byte count hashed (whole disk size).
-            let digest = ops::hash_disk(disk, args.length, &|p| sink.update(p));
+            let size = crate::disk::get(disk)?.size;
+            let bytes = args.length.map_or(size, |len| len.min(size));
+            let digest = ops::hash_disk(disk, Some(bytes), &|p| sink.update(p));
             sink.finish();
             HashData {
                 image: None,
                 disk: Some(disk),
-                bytes: args.length.unwrap_or(0),
+                bytes,
                 sha256: digest?,
             }
         }
-        _ => return Err(Error::usage("give either IMAGE or --disk N")),
+        _ => {
+            return Err(Error::usage("give either IMAGE or --disk N")
+                .with_hint("e.g. rsdiskwrite hash firmware.img  or  rsdiskwrite hash --disk 2"));
+        }
     };
     out.emit(&data, |data, _| {
         let target = data
@@ -63,6 +67,6 @@ pub fn run(args: HashArgs, out: &Output) -> Result<()> {
             .map(|p| p.display().to_string())
             .or(data.disk.map(|d| format!("PhysicalDrive{d}")))
             .unwrap_or_default();
-        format!("{}  {target}", data.sha256)
+        format!("{}  {target}  ({} bytes)", data.sha256, data.bytes)
     })
 }
