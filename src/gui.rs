@@ -1,10 +1,14 @@
+//! The graphical interface (AcmeUI Native).
+
 use std::{
     path::PathBuf,
     sync::mpsc::{self, Receiver, Sender},
     thread,
 };
 
-use crate::disk::{Disk, list_disks, write_image};
+use crate::disk::{self, Disk};
+use crate::error::Result;
+use crate::ops::{self, Phase, WriteRequest};
 use acme_core::Scene;
 use acme_platform::{
     Application, FrameContext, PlatformEvent, PlatformKey, Waker, WindowConfig, WindowId,
@@ -26,7 +30,7 @@ enum Action {
 
 enum Update {
     Progress(u64),
-    Finished(Result<u64, String>),
+    Finished(std::result::Result<u64, String>),
 }
 
 struct App {
@@ -72,7 +76,7 @@ impl App {
     }
 
     fn refresh(&mut self) {
-        match list_disks() {
+        match disk::list() {
             Ok(disks) => {
                 self.status = if disks.is_empty() {
                     "No disks found. Run as Administrator and check device connections.".into()
@@ -89,7 +93,7 @@ impl App {
             Err(error) => {
                 self.disks.clear();
                 self.selected = None;
-                self.status = format!("Cannot list disks: {error}");
+                self.status = format!("Cannot list disks: {}", error.message);
             }
         }
     }
@@ -140,16 +144,30 @@ impl App {
             self.status = "Select a target disk first.".into();
             return;
         };
-        let disk = Disk {
-            number: disk.number,
-            size: disk.size,
-            model: disk.model.clone(),
+        let request = WriteRequest {
+            expected: Some(disk.identity()),
+            allow_large: self.allow_large,
+            // TODO(phase2-E): verify checkbox (default on) and an allow-fixed option.
+            verify: false,
+            ..WriteRequest::new(&image, disk.number)
         };
+        let plan = match ops::plan(&request).and_then(|plan| plan.check().map(|_| plan)) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.status = format!("Cannot write: {}", error.message);
+                rfd::MessageDialog::new()
+                    .set_title("Write refused")
+                    .set_description(&error.message)
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_buttons(rfd::MessageButtons::Ok)
+                    .show();
+                return;
+            }
+        };
+        let disk = plan.disk.clone();
         let confirmation = format!(
-            "ALL DATA on PhysicalDrive{} ({}, {} bytes) will be overwritten and CANNOT BE RECOVERED.\n\nImage: {}\n\nAre you certain this is the correct target?",
-            disk.number,
-            disk.model,
-            disk.size,
+            "ALL DATA on {} will be overwritten and CANNOT BE RECOVERED.\n\nImage: {}\n\nAre you certain this is the correct target?",
+            disk.summary(),
             image.display()
         );
         if rfd::MessageDialog::new()
@@ -169,7 +187,6 @@ impl App {
         let sender = self.sender.clone();
         let progress_sender = sender.clone();
         let progress_waker = waker.clone();
-        let allow_large = self.allow_large;
         self.writing = true;
         self.bytes_written = 0;
         self.status = format!(
@@ -178,15 +195,19 @@ impl App {
         );
         thread::spawn(move || {
             let last = std::sync::atomic::AtomicU64::new(0);
-            let result = write_image(&image, &disk, allow_large, move |bytes| {
-                if bytes.saturating_sub(last.load(std::sync::atomic::Ordering::Relaxed))
-                    >= 1024 * 1024
+            let result = ops::execute(&plan, &|progress| {
+                let bytes = progress.done;
+                if progress.phase == Phase::Writing
+                    && bytes.saturating_sub(last.load(std::sync::atomic::Ordering::Relaxed))
+                        >= 1024 * 1024
                 {
                     last.store(bytes, std::sync::atomic::Ordering::Relaxed);
                     let _ = progress_sender.send(Update::Progress(bytes));
                     progress_waker.wake();
                 }
-            });
+            })
+            .map(|report| report.bytes_written)
+            .map_err(|error| error.message);
             let _ = sender.send(Update::Finished(result));
             waker.wake();
         });
@@ -576,10 +597,11 @@ impl Application for App {
     }
 }
 
-pub fn run() -> Result<(), String> {
+/// Opens the main window and blocks until it is closed.
+pub fn run() -> Result<()> {
     let mut app = App::new();
     app.refresh();
-    run_app(app).map_err(|error| error.to_string())
+    run_app(app).map_err(|error| crate::Error::internal(format!("GUI failed: {error}")))
 }
 
 #[cfg(test)]
@@ -589,13 +611,7 @@ mod tests {
     #[test]
     fn page_navigation_preserves_focus_and_a_new_image_clears_the_target() {
         let mut app = App::new();
-        app.disks = (0..5)
-            .map(|number| Disk {
-                number,
-                size: 1024,
-                model: "Test disk".into(),
-            })
-            .collect();
+        app.disks = (0..5).map(crate::disk::model::test_disk).collect();
         app.selected = Some(0);
         app.bytes_written = 512;
         app.focused = Action::Next;
