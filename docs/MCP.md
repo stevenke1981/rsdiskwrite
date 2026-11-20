@@ -1,4 +1,4 @@
-# MCP server (0.2.0)
+# MCP server (0.2.1)
 
 `rsdiskwrite mcp serve [--allow-write]` is a Model Context Protocol server over stdio: newline-delimited JSON-RPC 2.0, one message per line. stdout carries only protocol messages; all logs go to stderr. Supported methods: `initialize` (protocol versions 2025-06-18, 2025-03-26, 2024-11-05; otherwise it answers 2025-06-18), `notifications/initialized`, `ping`, `tools/list`, `tools/call`. Unknown methods return -32601; notifications get no response; bad tool arguments return -32602. Each input line may be at most 1 MiB; a longer line is discarded and answered with -32600 (null id) and the server keeps serving.
 

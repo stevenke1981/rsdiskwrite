@@ -4,7 +4,7 @@ Guide for AI agents. Part 1 is for agents working **on** this repo; part 2 is fo
 
 ## Part 1: working on rsdiskwrite
 
-Windows-only Rust crate (library + thin binary), edition 2024, MSRV 1.88, branch work happens on feature branches off `main`. Version 0.2.0.
+Windows-only Rust crate (library + thin binary), edition 2024, MSRV 1.88, branch work happens on feature branches off `main`. Version 0.2.1.
 
 ### Layout and ownership
 | Path | Owns |

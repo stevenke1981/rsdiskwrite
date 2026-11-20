@@ -7,9 +7,9 @@ Write raw or gzip-compressed disk images (`.img`, `.img.gz`) to USB sticks and S
 
 ## Install
 
-- **Release zip:** download `rsdiskwrite-0.2.0-x86_64-pc-windows-msvc.zip` from [GitHub Releases](https://github.com/stevenke1981/rsdiskwrite/releases). Each release also has the bare `.exe` and `SHA256SUMS.txt`. Verify before running:
+- **Release zip:** download `rsdiskwrite-0.2.1-x86_64-pc-windows-msvc.zip` from [GitHub Releases](https://github.com/stevenke1981/rsdiskwrite/releases). Each release also has the bare `.exe` and `SHA256SUMS.txt`. Verify before running:
   ```powershell
-  Get-FileHash .\rsdiskwrite-0.2.0-x86_64-pc-windows-msvc.zip -Algorithm SHA256
+  Get-FileHash .\rsdiskwrite-0.2.1-x86_64-pc-windows-msvc.zip -Algorithm SHA256
   Get-Content .\SHA256SUMS.txt   # the hashes must match
   ```
 - **From source:** needs Windows x86-64 and Rust 1.88+ (see [Build and test](#build-and-test)).
