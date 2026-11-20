@@ -398,7 +398,10 @@ fn mcp_round_trip() -> Result<usize> {
     let writer = buffer.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let config = crate::mcp::ServerConfig::new(false);
+        // Quiet: the self-test must not print the server's stderr log lines into the
+        // doctor report.
+        let mut config = crate::mcp::ServerConfig::new(false);
+        config.quiet = true;
         let _ = tx.send(crate::mcp::serve(
             std::io::Cursor::new(input.into_bytes()),
             writer,

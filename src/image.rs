@@ -54,7 +54,9 @@ pub struct Prepared {
     pub format: ImageFormat,
 }
 
-fn open_source(path: &Path) -> Result<File> {
+/// Opens an image for reading, sharing only reads so it cannot be modified or replaced
+/// while the handle is open.
+pub(crate) fn open_source(path: &Path) -> Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(windows)]
@@ -202,7 +204,17 @@ pub fn prepare(
     capacity: u64,
     make_temp: impl FnOnce() -> Result<File>,
 ) -> Result<Prepared> {
-    let file = open_source(path)?;
+    prepare_from(open_source(path)?, capacity, make_temp)
+}
+
+/// [`prepare`] from an already open image handle (read from its current position, which
+/// callers rewind to 0). Lets a caller hash the very handle that is then written, so the
+/// file cannot be swapped between hashing and writing. Raw images return `file` itself.
+pub fn prepare_from(
+    file: File,
+    capacity: u64,
+    make_temp: impl FnOnce() -> Result<File>,
+) -> Result<Prepared> {
     let io_err = |e: io::Error| Error::io("Cannot read image", e);
     let mut reader = BufReader::new(file);
     let format = if next_is_gzip(&mut reader).map_err(io_err)? {
@@ -322,6 +334,26 @@ mod tests {
         assert!(OpenOptions::new().write(true).open(&path).is_err());
         drop(source);
         assert!(OpenOptions::new().write(true).open(&path).is_ok());
+    }
+
+    #[test]
+    fn prepare_from_uses_the_given_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("raw.img");
+        std::fs::write(&raw, [5u8; 1024]).unwrap();
+        let mut handle = open_source(&raw).unwrap();
+        let digest = crate::hash::sha256_reader(&mut handle, None, &|_| {}).unwrap();
+        assert_eq!(digest, sha(&[5u8; 1024]));
+        handle.seek(SeekFrom::Start(0)).unwrap();
+        let image = prepare_from(handle, 1024, || panic!("raw image used a temp file")).unwrap();
+        assert_eq!((image.size, image.format), (1024, ImageFormat::Raw));
+        assert_eq!(read_all(image), vec![5u8; 1024]);
+
+        let packed = dir.path().join("image.gz");
+        std::fs::write(&packed, gzip(b"payload")).unwrap();
+        let image = prepare_from(open_source(&packed).unwrap(), 512, temp_file).unwrap();
+        assert_eq!((image.size, image.format), (7, ImageFormat::Gzip));
+        assert_eq!(read_all(image), b"payload");
     }
 
     #[test]

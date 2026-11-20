@@ -89,8 +89,9 @@ impl Confirmer for DialogConfirmer {
     }
 }
 
+/// Native message box helper, shared with the GUI.
 #[cfg(windows)]
-mod dialog {
+pub(crate) mod dialog {
     use std::ffi::c_void;
 
     const MB_YESNO: u32 = 0x0000_0004;
@@ -112,8 +113,9 @@ mod dialog {
             .collect()
     }
 
-    /// Blocks until the human answers; true only for "Yes".
-    pub(super) fn yes_no_default_no(title: &str, body: &str) -> bool {
+    /// Shows a blocking, topmost Yes/No warning box whose default button is No (Enter or
+    /// closing the box declines). Blocks until the human answers; true only for "Yes".
+    pub(crate) fn yes_no_default_no(title: &str, body: &str) -> bool {
         let title = wide(title);
         let body = wide(body);
         let flags = MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND | MB_TOPMOST;

@@ -232,6 +232,20 @@ fn protocol_errors() {
 }
 
 #[test]
+fn oversized_line_is_rejected_and_serving_continues() {
+    // Just over the 1 MiB per-line limit.
+    let huge = request(1, "ping", json!({"pad": "x".repeat(1024 * 1024)}));
+    let lines = session(&[], &[huge, request(2, "ping", json!({}))]);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    let rejected = lines
+        .iter()
+        .find(|l| l["id"].is_null())
+        .expect("invalid request response with null id");
+    assert_eq!(rejected["error"]["code"], -32600);
+    assert_eq!(response(&lines, 2)["result"], json!({}));
+}
+
+#[test]
 fn notifications_are_never_answered() {
     let lines = session(
         &[],

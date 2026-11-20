@@ -51,8 +51,11 @@ pub(crate) fn query(number: u32) -> io::Result<Disk> {
 /// Uses SetupAPI (`GUID_DEVINTERFACE_DISK`) when available and falls back to probing
 /// `PhysicalDrive0..=`[`MAX_PROBED_DISK`]. Disks without media (empty card readers)
 /// are omitted. `is_system` is filled in from `%SystemRoot%`'s volume.
+///
+/// Fails when the disk holding `%SystemRoot%` cannot be determined: a list in which the
+/// Windows disk is not marked would present it as an ordinary, selectable target.
 pub fn enumerate() -> Result<Enumeration> {
-    let system = volume::system_disks().unwrap_or_default();
+    let system = volume::system_disks().map_err(system_unknown)?;
     let (found, method) = match setupapi_disks() {
         Ok(found) if !found.is_empty() => (found, EnumerationMethod::SetupApi),
         _ => (probe_disks(), EnumerationMethod::Probe),
@@ -65,6 +68,21 @@ pub fn enumerate() -> Result<Enumeration> {
         })
         .collect();
     Ok(Enumeration { disks, method })
+}
+
+/// The error for a failed `%SystemRoot%` disk lookup during enumeration.
+fn system_unknown(error: Error) -> Error {
+    Error::new(
+        error.kind,
+        format!(
+            "Cannot determine which disk holds Windows, so no disk can be shown as safe to \
+             select: {}",
+            error.message
+        ),
+    )
+    .with_hint(
+        "Check that %SystemRoot% points at the Windows folder, then run 'rsdiskwrite doctor'",
+    )
 }
 
 /// Probes `PhysicalDrive0..=MAX_PROBED_DISK`.
@@ -233,7 +251,9 @@ pub fn get(number: u32) -> Result<Disk> {
             Error::io(format!("Cannot query PhysicalDrive{number}"), e)
         }
     })?;
-    disk.is_system = volume::system_disks()?.contains(&number);
+    disk.is_system = volume::system_disks()
+        .map_err(system_unknown)?
+        .contains(&number);
     Ok(disk)
 }
 
@@ -247,6 +267,18 @@ mod tests {
         assert_eq!(parse_wide_path(&wide).as_deref(), Some(r"\\?\usbstor#disk"));
         assert_eq!(parse_wide_path(&[0, 65]), None);
         assert_eq!(parse_wide_path(&[]), None);
+    }
+
+    #[test]
+    fn unknown_system_disk_is_an_error_with_a_hint() {
+        let error = system_unknown(Error::internal("no volume"));
+        assert_eq!(error.kind, ErrorKind::Internal);
+        assert!(
+            error.message.contains("which disk holds Windows"),
+            "{error}"
+        );
+        assert!(error.message.contains("no volume"), "{error}");
+        assert!(error.hint.is_some());
     }
 
     #[test]

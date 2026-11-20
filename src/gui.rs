@@ -288,7 +288,7 @@ impl App {
         };
         let disk = plan.disk.clone();
         let confirmation = format!(
-            "ALL DATA on this disk will be overwritten and CANNOT BE RECOVERED.\n\nDisk number: {}\nModel: {}\nSerial: {}\nBus: {}\nSize: {} ({} bytes)\nImage: {}\nVerify after write: {}\n\nAre you certain this is the correct target?",
+            "ALL DATA on this disk will be overwritten and CANNOT BE RECOVERED.\n\nDisk number: {}\nModel: {}\nSerial: {}\nBus: {}\nSize: {} ({} bytes)\nImage: {}\nVerify after write: {}\n\nAre you certain this is the correct target?\n\n(Default: No. Pressing Enter or closing this window cancels.)",
             disk.number,
             disk.model,
             disk.serial.as_deref().unwrap_or("(none)"),
@@ -298,14 +298,13 @@ impl App {
             image.display(),
             if self.verify { "yes" } else { "no" }
         );
-        if rfd::MessageDialog::new()
-            .set_title("Confirm irreversible disk write")
-            .set_description(&confirmation)
-            .set_level(rfd::MessageLevel::Warning)
-            .set_buttons(rfd::MessageButtons::YesNo)
-            .show()
-            != rfd::MessageDialogResult::Yes
-        {
+        // MessageBoxW, not rfd: rfd cannot make No the default button, and a default Yes
+        // would let a stray Enter (or a held, auto-repeating key) erase the disk.
+        if !crate::mcp::gate::dialog::yes_no_default_no(
+            "Confirm irreversible disk write",
+            &confirmation,
+        ) {
+            self.status = "Write cancelled; nothing was written.".into();
             return;
         }
         let Some(waker) = self.waker.clone() else {
@@ -542,11 +541,17 @@ impl Application for App {
                 self.focused = self.buttons[index].0;
                 true
             }
+            // Auto-repeat from a held key never activates anything, so holding Enter cannot
+            // click through a dialog into the next action.
             PlatformEvent::Key {
                 key: PlatformKey::Enter | PlatformKey::Space,
                 pressed: true,
+                repeat,
                 ..
             } => {
+                if repeat {
+                    return false;
+                }
                 if self
                     .buttons
                     .iter()
@@ -831,6 +836,38 @@ mod tests {
         assert_eq!(app.image, Some(PathBuf::from("second.img")));
         assert_eq!(app.selected, None);
         assert_eq!(app.bytes_written, 0);
+    }
+
+    #[test]
+    fn auto_repeated_keys_do_not_activate() {
+        let mut app = App::new();
+        app.disks = (0..5).map(crate::disk::model::test_disk).collect();
+        app.focused = Action::Next;
+        app.frame(FrameContext {
+            window: WindowId(1),
+            logical_width: 900.0,
+            logical_height: 680.0,
+            scale_factor: 1.0,
+        });
+        for key in [PlatformKey::Enter, PlatformKey::Space] {
+            let held = PlatformEvent::Key {
+                window: WindowId(1),
+                key,
+                pressed: true,
+                shift: false,
+                ctrl: false,
+                alt: false,
+                meta: false,
+                repeat: true,
+                text: None,
+                character: None,
+            };
+            assert!(!app.event(held));
+        }
+        assert_eq!(
+            app.page, 0,
+            "a repeated key must not activate the focused button"
+        );
     }
 
     #[test]
