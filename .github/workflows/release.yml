@@ -1,0 +1,67 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and publish, e.g. v0.1.0'
+        required: true
+        type: string
+permissions:
+  contents: write
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  release:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      TAG_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || '' }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          $tag = $env:TAG_NAME
+          if ($tag -notmatch '^v(.+)$') { throw "Tag '$tag' must look like v<version>" }
+          $tagVersion = $Matches[1]
+          $metaJson = cargo metadata --no-deps --format-version 1
+          if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed with exit code $LASTEXITCODE" }
+          $meta = $metaJson | ConvertFrom-Json
+          $pkg = $meta.packages | Where-Object { $_.name -eq 'rsdiskwrite' } | Select-Object -First 1
+          if (-not $pkg) { throw 'Package rsdiskwrite not found in cargo metadata' }
+          if ($tagVersion -ne $pkg.version) { throw "Tag version '$tagVersion' does not match Cargo.toml version '$($pkg.version)'" }
+          Add-Content -Path $env:GITHUB_ENV -Value "VERSION=$tagVersion"
+      - name: Run tests
+        run: |
+          cargo test --locked
+          if ($LASTEXITCODE -ne 0) { throw "cargo test failed with exit code $LASTEXITCODE" }
+      - name: Build release binary
+        run: |
+          cargo build --release --locked
+          if ($LASTEXITCODE -ne 0) { throw "cargo build failed with exit code $LASTEXITCODE" }
+      - name: Package artifacts
+        run: pwsh -NoProfile -File scripts/package.ps1 -Version $env:VERSION
+      - name: Create or update GitHub release
+        run: |
+          $tag = $env:TAG_NAME
+          $assets = @(Get-ChildItem -LiteralPath dist -File | ForEach-Object { $_.FullName })
+          if ($assets.Count -eq 0) { throw 'No files found in dist/' }
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag @assets --clobber
+          } else {
+            gh release create $tag @assets --title "rsdiskwrite $tag" --generate-notes --verify-tag
+          }
+          if ($LASTEXITCODE -ne 0) { throw "gh failed with exit code $LASTEXITCODE" }
