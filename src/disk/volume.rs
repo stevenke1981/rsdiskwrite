@@ -27,7 +27,7 @@ pub struct VolumeInfo {
     pub disks: Option<Vec<u32>>,
 }
 
-/// Locked (and, once implemented, dismounted) volume handles. Dropping releases the locks.
+/// Locked and dismounted volume handles. Dropping releases the locks.
 #[derive(Debug)]
 pub struct VolumeLocks {
     handles: Vec<File>,
@@ -171,6 +171,23 @@ pub fn volumes() -> Result<Vec<VolumeInfo>> {
         .collect())
 }
 
+/// `FSCTL_LOCK_VOLUME`, retried briefly because Explorer, indexers and antivirus often
+/// hold a volume open for a moment after it is mounted.
+fn lock_volume(file: &File) -> io::Result<()> {
+    const ATTEMPTS: u32 = 4;
+    let mut attempt = 1;
+    loop {
+        match ioctl::ioctl(file, ioctl::FSCTL_LOCK_VOLUME, &[], &mut []) {
+            Ok(_) => return Ok(()),
+            Err(e) if attempt >= ATTEMPTS => return Err(e),
+            Err(_) => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        }
+    }
+}
+
 /// Locks (`FSCTL_LOCK_VOLUME`) and dismounts (`FSCTL_DISMOUNT_VOLUME`) every volume on
 /// disk `number`. Fails if any volume cannot be inspected or locked (e.g. files are open);
 /// requires elevation ([`crate::ErrorKind::ElevationRequired`] otherwise). Keep the result
@@ -200,11 +217,14 @@ pub fn lock_and_dismount(number: u32) -> Result<VolumeLocks> {
                 "Target volume changed during locking",
             ));
         }
-        ioctl::ioctl(&file, ioctl::FSCTL_LOCK_VOLUME, &[], &mut []).map_err(|e| {
+        lock_volume(&file).map_err(|e| {
             Error::io(format!("Cannot lock target volume {path}"), e)
                 .with_hint("Close programs and Explorer windows using the disk")
         })?;
-        // TODO(phase2-A): FSCTL_DISMOUNT_VOLUME after locking.
+        // Dismounting a locked volume invalidates its cached file-system state so nothing
+        // is flushed over the new image; the volume stays unavailable while we hold the lock.
+        ioctl::ioctl(&file, ioctl::FSCTL_DISMOUNT_VOLUME, &[], &mut [])
+            .map_err(|e| Error::io(format!("Cannot dismount target volume {path}"), e))?;
         locked.push(file);
     }
     Ok(VolumeLocks { handles: locked })

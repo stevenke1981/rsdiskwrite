@@ -13,11 +13,8 @@ pub(crate) const IOCTL_DISK_GET_DRIVE_GEOMETRY_EX: u32 = 0x0007_00a0;
 pub(crate) const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002d_1400;
 pub(crate) const IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS: u32 = 0x0056_0000;
 pub(crate) const FSCTL_LOCK_VOLUME: u32 = 0x0009_0018;
-#[allow(dead_code)] // TODO(phase2-A): used by dismount.
 pub(crate) const FSCTL_DISMOUNT_VOLUME: u32 = 0x0009_0020;
-#[allow(dead_code)] // TODO(phase2-A): issued after a successful write.
 pub(crate) const IOCTL_DISK_UPDATE_PROPERTIES: u32 = 0x0007_0140;
-#[allow(dead_code)] // TODO(phase2-A): SetupAPI enumeration.
 pub(crate) const IOCTL_STORAGE_GET_DEVICE_NUMBER: u32 = 0x002d_1080;
 
 /// `FILE_SHARE_READ | FILE_SHARE_WRITE`.
@@ -29,7 +26,6 @@ pub(crate) enum Access {
     /// Desired access 0: enough for `FILE_ANY_ACCESS` ioctls; works unelevated.
     Query,
     /// `GENERIC_READ` (needs Administrator for physical disks).
-    #[allow(dead_code)] // TODO(phase2-A): used by verify and disk hashing.
     Read,
     /// `GENERIC_READ | GENERIC_WRITE` (needs Administrator).
     ReadWrite,
@@ -110,6 +106,21 @@ pub(crate) fn parse_geometry(buf: &[u8]) -> Option<Geometry> {
     })
 }
 
+/// `IOCTL_STORAGE_GET_DEVICE_NUMBER` (`FILE_ANY_ACCESS`): the N of `PhysicalDriveN` for a
+/// disk device handle (e.g. one opened from a SetupAPI interface path).
+pub(crate) fn device_number(file: &File) -> io::Result<u32> {
+    let mut buffer = [0u8; 12];
+    let n = ioctl(file, IOCTL_STORAGE_GET_DEVICE_NUMBER, &[], &mut buffer)?;
+    parse_device_number(&buffer[..n])
+        .ok_or_else(|| io::Error::other("short storage device number response"))
+}
+
+/// Parses `STORAGE_DEVICE_NUMBER`: `DeviceType` at 0, `DeviceNumber` at 4,
+/// `PartitionNumber` at 8.
+pub(crate) fn parse_device_number(buf: &[u8]) -> Option<u32> {
+    read_u32(buf, 4)
+}
+
 /// Fields of `STORAGE_DEVICE_DESCRIPTOR` that rsdiskwrite uses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DeviceDescriptor {
@@ -186,6 +197,17 @@ mod tests {
         buf[16..20].copy_from_slice(&5000u32.to_le_bytes());
         assert_eq!(parse_device_descriptor(&buf).model, "SanDisk");
         assert_eq!(parse_device_descriptor(&[]).model, "Unknown model");
+    }
+
+    #[test]
+    fn device_number_parsing() {
+        let mut buf = [0u8; 12];
+        buf[0..4].copy_from_slice(&7u32.to_le_bytes());
+        buf[4..8].copy_from_slice(&3u32.to_le_bytes());
+        assert_eq!(parse_device_number(&buf), Some(3));
+        assert_eq!(parse_device_number(&buf[..8]), Some(3));
+        assert_eq!(parse_device_number(&buf[..7]), None);
+        assert_eq!(parse_device_number(&[]), None);
     }
 
     #[test]

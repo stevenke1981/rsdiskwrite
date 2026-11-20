@@ -4,11 +4,11 @@
 //! Bytes after the last gzip member (e.g. an m0n0wall signature block) are ignored.
 
 use crate::error::{Error, ErrorKind, Result};
-use crate::hash::Digest;
+use crate::hash::{Digest, Hasher};
 use flate2::bufread::GzDecoder;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufReader, Read, Seek, SeekFrom};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 /// Image container format.
@@ -96,9 +96,97 @@ pub fn detect_format(path: &Path) -> Result<ImageFormat> {
 /// computes [`ImageInfo::sha256`] and [`ImageInfo::content_sha256`].
 /// Corrupt gzip data is [`ErrorKind::InvalidImage`].
 pub fn inspect(path: &Path, sha256: bool) -> Result<ImageInfo> {
-    // TODO(phase2-A): implement streaming inspection (members, trailing bytes, hashes).
-    let _ = (path, sha256);
-    Err(Error::unsupported("image inspection"))
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|e| Error::io(format!("Cannot open image {}", path.display()), e))?;
+    let file = open_source(&canonical)?;
+    let io_err = |e: io::Error| Error::io("Cannot read image", e);
+    let file_size = file.metadata().map_err(io_err)?.len();
+    let mut reader = BufReader::with_capacity(crate::copy::CHUNK_SIZE, file);
+    let format = if next_is_gzip(&mut reader).map_err(io_err)? {
+        ImageFormat::Gzip
+    } else {
+        ImageFormat::Raw
+    };
+    let mut info = ImageInfo {
+        path: canonical,
+        format,
+        file_size,
+        decompressed_size: file_size,
+        gzip_members: 0,
+        trailing_bytes: 0,
+        sha256: None,
+        content_sha256: None,
+    };
+    if format == ImageFormat::Gzip {
+        let mut hasher = sha256.then(Hasher::new);
+        let mut buffer = vec![0u8; crate::copy::CHUNK_SIZE];
+        let mut decoded = 0u64;
+        loop {
+            let mut member = GzDecoder::new(&mut reader);
+            loop {
+                let n = match member.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(decompress_error(e)),
+                };
+                if let Some(hasher) = hasher.as_mut() {
+                    hasher.update(&buffer[..n]);
+                }
+                decoded += n as u64;
+            }
+            info.gzip_members += 1;
+            if !next_is_gzip(&mut reader).map_err(io_err)? {
+                break;
+            }
+        }
+        let consumed = reader.stream_position().map_err(io_err)?;
+        info.decompressed_size = decoded;
+        info.trailing_bytes = file_size.saturating_sub(consumed);
+        info.content_sha256 = hasher.map(Hasher::finish);
+    }
+    if sha256 {
+        // Same handle (sharing reads only), so the file cannot change between passes.
+        reader.seek(SeekFrom::Start(0)).map_err(io_err)?;
+        let digest = crate::hash::sha256_reader(&mut reader, Some(file_size), &|_| {})?;
+        info.sha256 = Some(digest);
+        if format == ImageFormat::Raw {
+            info.content_sha256 = Some(digest);
+        }
+    }
+    Ok(info)
+}
+
+fn decompress_error(e: io::Error) -> Error {
+    Error::new(
+        ErrorKind::InvalidImage,
+        format!("Cannot decompress image: {e}"),
+    )
+}
+
+/// True when the next two bytes of `reader` are the gzip magic `1f 8b`. Does not consume
+/// anything (the position is restored, even across a buffer boundary).
+fn next_is_gzip<R: Read + Seek>(reader: &mut BufReader<R>) -> io::Result<bool> {
+    let buffered = reader.fill_buf()?;
+    if buffered.len() >= 2 {
+        return Ok(buffered[..2] == [0x1f, 0x8b]);
+    }
+    if buffered.is_empty() {
+        return Ok(false);
+    }
+    // Exactly one byte left in the buffer: read both bytes, then seek back.
+    let mut next = [0u8; 2];
+    let mut read = 0;
+    while read < 2 {
+        match reader.read(&mut next[read..]) {
+            Ok(0) => break,
+            Ok(n) => read += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    reader.seek(SeekFrom::Current(-(read as i64)))?;
+    Ok(read == 2 && next == [0x1f, 0x8b])
 }
 
 /// Prepares `path` for writing to a disk of `capacity` bytes.
@@ -117,10 +205,7 @@ pub fn prepare(
     let file = open_source(path)?;
     let io_err = |e: io::Error| Error::io("Cannot read image", e);
     let mut reader = BufReader::new(file);
-    let mut magic = [0u8; 2];
-    let read = reader.read(&mut magic).map_err(io_err)?;
-    reader.seek(SeekFrom::Start(0)).map_err(io_err)?;
-    let format = if read == 2 && magic == [0x1f, 0x8b] {
+    let format = if next_is_gzip(&mut reader).map_err(io_err)? {
         ImageFormat::Gzip
     } else {
         ImageFormat::Raw
@@ -132,28 +217,13 @@ pub fn prepare(
             // Allow one extra byte to detect oversized images while still checking the gzip
             // trailer when the decompressed size is exactly the remaining capacity.
             let mut member = GzDecoder::new(&mut reader).take(remaining.saturating_add(1));
-            let decoded = io::copy(&mut member, &mut temp).map_err(|e| {
-                Error::new(
-                    ErrorKind::InvalidImage,
-                    format!("Cannot decompress image: {e}"),
-                )
-            })?;
+            let decoded = io::copy(&mut member, &mut temp).map_err(decompress_error)?;
             remaining = remaining.checked_sub(decoded).ok_or_else(|| {
                 Error::refusal(format!(
                     "Decompressed image exceeds disk capacity ({capacity} bytes)"
                 ))
             })?;
-            let mut next = [0u8; 2];
-            let first = reader.read(&mut next[..1]).map_err(io_err)?;
-            let second = if first == 1 {
-                reader.read(&mut next[1..]).map_err(io_err)?
-            } else {
-                0
-            };
-            reader
-                .seek(SeekFrom::Current(-((first + second) as i64)))
-                .map_err(io_err)?;
-            if first + second != 2 || next != [0x1f, 0x8b] {
+            if !next_is_gzip(&mut reader).map_err(io_err)? {
                 break;
             }
         }
@@ -298,5 +368,118 @@ mod tests {
         let error = prepare(&path, 2048, temp_file).unwrap_err();
         assert!(error.message.contains("Cannot decompress"), "{error}");
         assert_eq!(error.kind, ErrorKind::InvalidImage);
+    }
+
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+        gzip.write_all(data).unwrap();
+        gzip.finish().unwrap()
+    }
+
+    fn sha(data: &[u8]) -> Digest {
+        let mut hasher = Hasher::new();
+        hasher.update(data);
+        hasher.finish()
+    }
+
+    #[test]
+    fn inspect_raw_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw.img");
+        let data = vec![3u8; 4096];
+        std::fs::write(&path, &data).unwrap();
+        let info = inspect(&path, false).unwrap();
+        assert_eq!(info.format, ImageFormat::Raw);
+        assert_eq!(info.file_size, 4096);
+        assert_eq!(info.decompressed_size, 4096);
+        assert_eq!(info.gzip_members, 0);
+        assert_eq!(info.trailing_bytes, 0);
+        assert_eq!(info.sha256, None);
+        assert_eq!(info.content_sha256, None);
+        assert!(info.path.is_absolute());
+
+        let info = inspect(&path, true).unwrap();
+        assert_eq!(info.sha256, Some(sha(&data)));
+        assert_eq!(info.content_sha256, Some(sha(&data)));
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["format"], "raw");
+        assert_eq!(json["sha256"], sha(&data).to_hex());
+    }
+
+    #[test]
+    fn inspect_gzip_with_trailing_bytes_and_hashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.gz");
+        let content = vec![42u8; 10_000];
+        let mut stored = gzip(&content);
+        let member_len = stored.len() as u64;
+        stored.extend_from_slice(b"signature");
+        std::fs::write(&path, &stored).unwrap();
+
+        let info = inspect(&path, true).unwrap();
+        assert_eq!(info.format, ImageFormat::Gzip);
+        assert_eq!(info.file_size, member_len + 9);
+        assert_eq!(info.decompressed_size, 10_000);
+        assert_eq!(info.gzip_members, 1);
+        assert_eq!(info.trailing_bytes, 9);
+        assert_eq!(info.sha256, Some(sha(&stored)));
+        assert_eq!(info.content_sha256, Some(sha(&content)));
+        assert_eq!(inspect(&path, false).unwrap().content_sha256, None);
+    }
+
+    #[test]
+    fn inspect_counts_gzip_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.gz");
+        let mut stored = gzip(b"first");
+        stored.extend(gzip(b"second"));
+        stored.extend(gzip(b"third"));
+        std::fs::write(&path, &stored).unwrap();
+        let info = inspect(&path, true).unwrap();
+        assert_eq!(info.gzip_members, 3);
+        assert_eq!(info.decompressed_size, 16);
+        assert_eq!(info.trailing_bytes, 0);
+        assert_eq!(info.content_sha256, Some(sha(b"firstsecondthird")));
+
+        // Member boundary straddling the read buffer is still detected.
+        let mut first = GzEncoder::new(Vec::new(), Compression::none());
+        first
+            .write_all(&pattern_bytes(crate::copy::CHUNK_SIZE))
+            .unwrap();
+        let mut stored = first.finish().unwrap();
+        stored.extend(gzip(b"next"));
+        std::fs::write(&path, &stored).unwrap();
+        let info = inspect(&path, false).unwrap();
+        assert_eq!(info.gzip_members, 2);
+        assert_eq!(info.decompressed_size, crate::copy::CHUNK_SIZE as u64 + 4);
+    }
+
+    fn pattern_bytes(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i * 7 % 256) as u8).collect()
+    }
+
+    #[test]
+    fn inspect_rejects_corrupt_gzip_and_missing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.gz");
+        let mut stored = gzip(&[1u8; 2048]);
+        let crc = stored.len() - 8;
+        stored[crc] ^= 1;
+        std::fs::write(&path, &stored).unwrap();
+        assert_eq!(
+            inspect(&path, false).unwrap_err().kind,
+            ErrorKind::InvalidImage
+        );
+        std::fs::write(&path, [0x1f, 0x8b, 8]).unwrap();
+        assert_eq!(
+            inspect(&path, false).unwrap_err().kind,
+            ErrorKind::InvalidImage
+        );
+        assert_eq!(
+            inspect(&dir.path().join("missing.img"), false)
+                .unwrap_err()
+                .kind,
+            ErrorKind::Io
+        );
     }
 }

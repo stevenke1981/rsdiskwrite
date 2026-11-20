@@ -379,10 +379,7 @@ pub fn execute(plan: &WritePlan, progress: &dyn Fn(Progress)) -> Result<WriteRep
     })?;
     let size = prepared.size;
     let _locks = disk::lock_and_dismount(disk.number)?;
-    let mut target = ioctl::open_disk(disk.number, ioctl::Access::ReadWrite).map_err(|e| {
-        Error::io_elevation("Cannot open disk for writing", e)
-            .with_hint("Run as Administrator and close applications using the disk")
-    })?;
+    let mut target = open_disk(disk.number, ioctl::Access::ReadWrite)?;
     let current = enumerate::describe(disk.number, &target)
         .map_err(|e| Error::io("Cannot recheck target", e))?;
     if !disk::same_identity(&current, disk) {
@@ -397,6 +394,7 @@ pub fn execute(plan: &WritePlan, progress: &dyn Fn(Progress)) -> Result<WriteRep
             "Image size is not a multiple of the disk's {sector}-byte logical sector size"
         )));
     }
+    let mut hasher = crate::hash::Hasher::new();
     crate::copy::copy(
         &mut prepared.file,
         &mut target,
@@ -409,9 +407,10 @@ pub fn execute(plan: &WritePlan, progress: &dyn Fn(Progress)) -> Result<WriteRep
                 total: size,
             })
         },
-        None,
+        Some(&mut hasher),
     )
     .map_err(|e| Error::io("Write failed; the disk may be partially overwritten", e))?;
+    let content_sha256 = hasher.finish();
     progress(Progress {
         phase: Phase::Flushing,
         done: size,
@@ -423,17 +422,134 @@ pub fn execute(plan: &WritePlan, progress: &dyn Fn(Progress)) -> Result<WriteRep
             e,
         )
     })?;
-    // TODO(phase2-A): IOCTL_DISK_UPDATE_PROPERTIES, content SHA-256 and read-back verify
-    // (when plan.request.verify) on the same locked handle.
+    // Ask Windows to re-read the new partition table. Advisory: the data is already on the
+    // disk, and replugging the device has the same effect, so a failure is not an error.
+    let _ = ioctl::ioctl(&target, ioctl::IOCTL_DISK_UPDATE_PROPERTIES, &[], &mut []);
+    let verify = if plan.request.verify {
+        // Same handle, still holding the volume locks: what we read is what the device
+        // stores, not something a remounted file system wrote in between.
+        let first_mismatch = read_back(&mut prepared.file, &mut target, size, sector, progress)?;
+        if let Some(offset) = first_mismatch {
+            return Err(Error::new(
+                ErrorKind::VerifyMismatch,
+                format!(
+                    "Verification failed: {} differs from the image at byte {offset}",
+                    current.name()
+                ),
+            )
+            .with_hint("The device may be faulty or counterfeit; try another one"));
+        }
+        Some(VerifyReport {
+            disk: current.identity(),
+            image: plan.image.path.clone(),
+            bytes: size,
+            matched: true,
+            first_mismatch: None,
+            content_sha256: Some(content_sha256),
+        })
+    } else {
+        None
+    };
     Ok(WriteReport {
         disk: current,
         image: plan.image.path.clone(),
         format: prepared.format,
         bytes_written: size,
-        content_sha256: None,
-        verify: None,
+        content_sha256: Some(content_sha256),
+        verify,
         elapsed_ms: started.elapsed().as_millis() as u64,
     })
+}
+
+/// Opens a physical disk for reading or writing, mapping "access denied" to
+/// [`ErrorKind::ElevationRequired`] and a missing device to [`ErrorKind::DiskNotFound`].
+#[cfg(windows)]
+fn open_disk(number: u32, access: crate::disk::ioctl::Access) -> Result<std::fs::File> {
+    use crate::disk::ioctl::{self, Access};
+    ioctl::open_disk(number, access).map_err(|e| {
+        let purpose = if access == Access::ReadWrite {
+            "writing"
+        } else {
+            "reading"
+        };
+        let context = format!("Cannot open PhysicalDrive{number} for {purpose}");
+        match e.kind() {
+            std::io::ErrorKind::NotFound => Error::new(
+                ErrorKind::DiskNotFound,
+                format!("PhysicalDrive{number} does not exist"),
+            )
+            .with_hint("Run 'rsdiskwrite list' to see available disks"),
+            std::io::ErrorKind::PermissionDenied => Error::io_elevation(context, e),
+            _ => Error::io(context, e).with_hint("Close applications using the disk"),
+        }
+    })
+}
+
+/// Rewinds both handles and compares `size` bytes of `image` with `device` using
+/// sector-aligned reads, reporting [`Phase::Verifying`] progress.
+#[cfg(windows)]
+fn read_back(
+    image: &mut std::fs::File,
+    device: &mut std::fs::File,
+    size: u64,
+    sector: u32,
+    progress: &dyn Fn(Progress),
+) -> Result<Option<u64>> {
+    use std::io::{Seek, SeekFrom};
+    progress(Progress {
+        phase: Phase::Verifying,
+        done: 0,
+        total: size,
+    });
+    image
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| Error::io("Cannot rewind image for verification", e))?;
+    device
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| Error::io("Cannot rewind disk for verification", e))?;
+    crate::copy::compare(
+        std::io::BufReader::with_capacity(crate::copy::CHUNK_SIZE, image),
+        device,
+        size,
+        sector as usize,
+        &|done| {
+            progress(Progress {
+                phase: Phase::Verifying,
+                done,
+                total: size,
+            })
+        },
+    )
+    .map_err(|e| Error::io("Read-back verification failed", e))
+}
+
+/// A reader that feeds everything it reads to a [`crate::hash::Hasher`].
+#[cfg(windows)]
+struct HashingReader<'a, R> {
+    inner: R,
+    hasher: &'a mut crate::hash::Hasher,
+}
+
+#[cfg(windows)]
+impl<R: std::io::Read> std::io::Read for HashingReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+}
+
+/// Logical sector size to use for reads (512 when the device does not report one).
+#[cfg(windows)]
+fn read_sector(disk: &Disk) -> Result<u32> {
+    match disk.sector {
+        0 => Ok(512),
+        s if s <= crate::copy::CHUNK_SIZE as u32 => Ok(s),
+        s => Err(Error::new(
+            ErrorKind::Unsupported,
+            format!("Unsupported logical sector size {s}"),
+        )),
+    }
 }
 
 /// Reads disk `disk` back and compares it with `image` (decompressing gzip), without
@@ -441,18 +557,81 @@ pub fn execute(plan: &WritePlan, progress: &dyn Fn(Progress)) -> Result<WriteRep
 /// (callers turn that into [`ErrorKind::VerifyMismatch`]).
 #[cfg(windows)]
 pub fn verify(image: &Path, disk: u32, progress: &dyn Fn(Progress)) -> Result<VerifyReport> {
-    // TODO(phase2-A): read-back verification.
-    let _ = (image, disk, progress);
-    Err(Error::unsupported("read-back verification"))
+    use crate::disk::{enumerate, ioctl::Access};
+    let path = std::fs::canonicalize(image)
+        .map_err(|e| Error::io(format!("Cannot open image {}", image.display()), e))?;
+    let mut device = open_disk(disk, Access::Read)?;
+    let current =
+        enumerate::describe(disk, &device).map_err(|e| Error::io("Cannot query disk", e))?;
+    let sector = read_sector(&current)?;
+    progress(Progress {
+        phase: Phase::Preparing,
+        done: 0,
+        total: std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+    });
+    let mut prepared = crate::image::prepare(&path, current.size, || {
+        tempfile::tempfile_in(std::env::temp_dir())
+            .map_err(|e| Error::io("Cannot create temporary image", e))
+    })?;
+    let size = prepared.size;
+    let mut hasher = crate::hash::Hasher::new();
+    let expected = HashingReader {
+        inner: std::io::BufReader::with_capacity(crate::copy::CHUNK_SIZE, &mut prepared.file),
+        hasher: &mut hasher,
+    };
+    progress(Progress {
+        phase: Phase::Verifying,
+        done: 0,
+        total: size,
+    });
+    let first_mismatch =
+        crate::copy::compare(expected, &mut device, size, sector as usize, &|done| {
+            progress(Progress {
+                phase: Phase::Verifying,
+                done,
+                total: size,
+            })
+        })
+        .map_err(|e| Error::io("Read-back verification failed", e))?;
+    Ok(VerifyReport {
+        disk: current.identity(),
+        image: path,
+        bytes: size,
+        matched: first_mismatch.is_none(),
+        first_mismatch,
+        // Only meaningful when every byte was read.
+        content_sha256: first_mismatch.is_none().then(|| hasher.finish()),
+    })
 }
 
 /// SHA-256 of the first `len` bytes of disk `disk` (whole disk when `None`). Requires
 /// elevation. Reads are sector-aligned; `len` need not be.
 #[cfg(windows)]
 pub fn hash_disk(disk: u32, len: Option<u64>, progress: &dyn Fn(Progress)) -> Result<Digest> {
-    // TODO(phase2-A): disk hashing.
-    let _ = (disk, len, progress);
-    Err(Error::unsupported("disk hashing"))
+    use crate::disk::{enumerate, ioctl::Access};
+    let device = open_disk(disk, Access::Read)?;
+    let current =
+        enumerate::describe(disk, &device).map_err(|e| Error::io("Cannot query disk", e))?;
+    let sector = read_sector(&current)?;
+    let total = match len {
+        Some(len) if len > current.size => {
+            return Err(Error::usage(format!(
+                "Requested {len} bytes but {} has only {} bytes",
+                current.name(),
+                current.size
+            )));
+        }
+        Some(len) => len,
+        None => current.size,
+    };
+    crate::copy::hash_aligned(&device, total, sector as usize, &|done| {
+        progress(Progress {
+            phase: Phase::Hashing,
+            done,
+            total,
+        })
+    })
+    .map_err(|e| Error::io(format!("Cannot read {}", current.name()), e))
 }
 
 #[cfg(test)]
