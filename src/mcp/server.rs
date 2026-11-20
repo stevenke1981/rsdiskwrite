@@ -98,6 +98,7 @@ fn serve_with_store<R: BufRead, W: Write + Send + 'static>(
         plans,
         writing: Arc::new(AtomicBool::new(false)),
         calls: Arc::new(AtomicUsize::new(0)),
+        disk_reads: Arc::new(AtomicUsize::new(0)),
     };
     let quiet = state.config.quiet;
     log(
@@ -229,6 +230,8 @@ struct State<W> {
     writing: Arc<AtomicBool>,
     /// Number of other tool calls running.
     calls: Arc<AtomicUsize>,
+    /// Number of `verify_disk` calls reading a disk; `write_image` is refused while non-zero.
+    disk_reads: Arc<AtomicUsize>,
 }
 
 /// One of the [`MAX_CONCURRENT_CALLS`] tool-call slots; released when dropped.
@@ -435,6 +438,13 @@ impl<W: Write + Send + 'static> State<W> {
                 "Wait for the write to finish (it verifies the disk itself)",
             ));
         }
+        if is_write && self.disk_reads.load(Ordering::Acquire) > 0 {
+            return Some(busy(
+                id,
+                "write_image is unavailable while verify_disk is running",
+                "Wait for the verification to finish, then retry write_image",
+            ));
+        }
         let (slot, call_slot) = if is_write {
             match WriteSlot::acquire(&self.writing) {
                 Some(slot) => (Some(slot), None),
@@ -458,6 +468,11 @@ impl<W: Write + Send + 'static> State<W> {
                 }
             }
         };
+        // Admission above succeeded, so this cannot fail (no limit); it keeps writes out while
+        // a verification reads the disk.
+        let read_slot = (name == names::VERIFY_DISK)
+            .then(|| CallSlot::acquire(&self.disk_reads, usize::MAX))
+            .flatten();
         let quiet = self.config.quiet;
         log(quiet, &format!("tools/call {name}"));
         let out = self.out.clone();
@@ -503,6 +518,7 @@ impl<W: Write + Send + 'static> State<W> {
                 // can immediately start its next call.
                 drop(slot);
                 drop(call_slot);
+                drop(read_slot);
                 if let Err(e) = send(&out, &response) {
                     log(quiet, &format!("cannot send the {name} result: {e}"));
                 }
@@ -966,6 +982,7 @@ mod tests {
             plans: Arc::new(PlanStore::default()),
             writing: Arc::new(AtomicBool::new(false)),
             calls: Arc::new(AtomicUsize::new(0)),
+            disk_reads: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -1018,6 +1035,21 @@ mod tests {
         assert_eq!(busy_code(reply), "busy");
         assert!(workers.is_empty());
         assert_eq!(state.calls.load(Ordering::SeqCst), 0, "no slot leaked");
+    }
+
+    #[test]
+    fn write_is_busy_while_a_verify_reads_the_disk() {
+        let state = idle_state(true);
+        let mut workers = Vec::new();
+        let _verify = CallSlot::acquire(&state.disk_reads, usize::MAX).unwrap();
+        let write = json!({"name": "write_image", "arguments": {"plan_id": "plan_unknown"}});
+        let reply = state.call_tool(RequestId::Number(1), Some(write), &mut workers);
+        assert_eq!(busy_code(reply), "busy");
+        assert!(workers.is_empty());
+        assert!(
+            !state.writing.load(Ordering::SeqCst),
+            "write slot not taken"
+        );
     }
 
     #[test]

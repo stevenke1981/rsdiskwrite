@@ -16,7 +16,12 @@ $root = Split-Path -Parent $PSScriptRoot
 
 if (-not $Target) {
     $Target = 'x86_64-pc-windows-msvc'
-    $hostLine = (& rustc -vV 2>$null) | Where-Object { $_ -like 'host:*' } | Select-Object -First 1
+    $hostLine = $null
+    try {
+        $hostLine = (& rustc -vV 2>$null) | Where-Object { $_ -like 'host:*' } | Select-Object -First 1
+    } catch {
+        # rustc not on PATH: keep the default target label.
+    }
     if ($hostLine) { $Target = ($hostLine -replace '^host:\s*', '').Trim() }
 }
 

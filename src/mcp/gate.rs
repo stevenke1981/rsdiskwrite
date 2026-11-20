@@ -99,6 +99,7 @@ pub(crate) mod dialog {
     const MB_DEFBUTTON2: u32 = 0x0000_0100;
     const MB_SETFOREGROUND: u32 = 0x0001_0000;
     const MB_TOPMOST: u32 = 0x0004_0000;
+    const MB_TASKMODAL: u32 = 0x0000_2000;
     const IDYES: i32 = 6;
 
     #[link(name = "user32")]
@@ -118,7 +119,12 @@ pub(crate) mod dialog {
     pub(crate) fn yes_no_default_no(title: &str, body: &str) -> bool {
         let title = wide(title);
         let body = wide(body);
-        let flags = MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND | MB_TOPMOST;
+        let flags = MB_YESNO
+            | MB_ICONWARNING
+            | MB_DEFBUTTON2
+            | MB_SETFOREGROUND
+            | MB_TOPMOST
+            | MB_TASKMODAL;
         // SAFETY: both strings are NUL-terminated UTF-16 buffers that outlive the call; a
         // null owner window is allowed.
         let answer =
